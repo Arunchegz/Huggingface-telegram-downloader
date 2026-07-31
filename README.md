@@ -1,3 +1,14 @@
+---
+title: TGManager
+emoji: 📁
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+sdk_version: "4.0.0"
+app_file: app.py
+pinned: false
+---
+
 # TGFiles — Telegram File Browser for Hugging Face Spaces
 
 Browse, search, and download files from your Telegram chats via a Gradio web UI.
