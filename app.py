@@ -205,7 +205,7 @@ def load_recent():
 
 # ── build UI ──────────────────────────────────────────────────────────────────
 
-with gr.Blocks(title="TGFiles") as demo:
+with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
     gr.Markdown("# 📁 TGFiles — Telegram File Browser")
 
     with gr.Tabs():
@@ -309,5 +309,4 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         share=False,
-        theme=gr.themes.Soft(),
     )
