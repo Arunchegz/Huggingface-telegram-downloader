@@ -1,4 +1,5 @@
 gradio==3.50.2
+jinja2==3.0.3
 pyrogram
 tgcrypto
 aiofiles
