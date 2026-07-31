@@ -18,6 +18,7 @@ def _run_api():
     uvicorn.run(fastapi_app, host="0.0.0.0", port=7861, log_level="warning")
 
 threading.Thread(target=_run_api, daemon=True).start()
+time.sleep(1)  # let FastAPI bind before Gradio starts
 init_db()
 
 
@@ -204,7 +205,7 @@ def load_recent():
 
 # ── build UI ──────────────────────────────────────────────────────────────────
 
-with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="TGFiles") as demo:
     gr.Markdown("# 📁 TGFiles — Telegram File Browser")
 
     with gr.Tabs():
@@ -304,4 +305,9 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        theme=gr.themes.Soft(),
+    )
