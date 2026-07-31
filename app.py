@@ -1,5 +1,6 @@
 import asyncio
 import gradio as gr
+import spaces
 from pathlib import Path
 
 from database import init_db
@@ -9,6 +10,10 @@ from telegram_client import fetch_chats, scan_chat, download_file, get_me
 from database import get_chats, toggle_favorite, recent_downloads, get_file_by_msg
 
 init_db()
+
+@spaces.GPU
+def _dummy_gpu():
+    pass
 
 # ── async runner ──────────────────────────────────────────────────────────────
 
