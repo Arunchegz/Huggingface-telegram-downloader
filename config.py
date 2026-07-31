@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 # Pyrogram
-API_ID = int(os.environ.get("TG_API_ID", 0))
+API_ID = int(os.environ.get("TG_API_ID") or 0)
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
