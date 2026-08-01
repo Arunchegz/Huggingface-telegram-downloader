@@ -339,7 +339,7 @@ async def download_channel_all(
     if status_cb:
         status_cb(f"🎯 {len(pending)} files to download (clients: {len(dl_clients)})")
 
-    sem = asyncio.Semaphore(len(dl_clients))
+    sem = asyncio.Semaphore(1)
     counter = {"n": 0}
     lock = asyncio.Lock()
 
@@ -405,7 +405,7 @@ async def watch_channel_new(
                 _save_last_msg_id(chat_id, last_id)
 
             if pending:
-                sem = asyncio.Semaphore(len(dl_clients))
+                sem = asyncio.Semaphore(1)
                 counter = {"n": 0}
                 lock = asyncio.Lock()
 
