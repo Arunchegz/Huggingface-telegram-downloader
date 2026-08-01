@@ -3,7 +3,7 @@ import mimetypes
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -173,7 +173,7 @@ async def recent():
 async def serve_file(
     chat_id: int,
     message_id: int,
-    request: Request,
+    request_range: Optional[str] = None,
 ):
     local = resolve_local_path(chat_id, message_id)
     if not local:
@@ -183,20 +183,14 @@ async def serve_file(
     mime = mime or "application/octet-stream"
     size = local.stat().st_size
 
-    range_header = request.headers.get("Range")
-    if range_header and range_header.startswith("bytes="):
+    if request_range and request_range.startswith("bytes="):
         try:
-            range_val = range_header[6:]
-            start_str, end_str = range_val.split("-", 1)
+            range_val = request_range[6:]
+            start_str, end_str = range_val.split("-")
             start = int(start_str)
-            end = int(end_str) if end_str.strip() else size - 1
-            if start > end or end >= size:
-                return Response(
-                    status_code=416,
-                    headers={"Content-Range": f"bytes */{size}"},
-                )
+            end = int(end_str) if end_str else size - 1
         except Exception:
-            raise HTTPException(400, "Invalid Range header")
+            raise HTTPException(400, "Invalid range header")
 
         headers = {
             "Content-Range": f"bytes {start}-{end}/{size}",

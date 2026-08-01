@@ -134,7 +134,7 @@ def _base_url(request: Request) -> str:
 def _file_url(base: str, f: dict) -> str:
     fname = urllib.parse.quote(f["file_name"])
     if STORAGE_BUCKET_BASE:
-        return f"{STORAGE_BUCKET_BASE}/{f['chat_id']}/{fname}"
+        return f"{STORAGE_BUCKET_BASE}/{f['chat_id']}/{fname}?download=true"
     return f"{base}/tgfile/{f['chat_id']}/{f['message_id']}/{fname}"
 
 

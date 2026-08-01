@@ -1,24 +1,14 @@
 import sqlite3
 import json
-from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from config import DB_PATH
 
 
-@contextmanager
 def get_conn():
-    """Context manager that opens, yields, commits/rolls back, and closes the connection."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return conn
 
 
 def init_db():

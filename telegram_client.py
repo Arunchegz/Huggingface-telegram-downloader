@@ -190,9 +190,7 @@ async def download_file(
     client: Client | None = None,
 ) -> Path | None:
     """Download file to DOWNLOAD_DIR. Returns local path or None on failure."""
-    # Use watcher client (download pool head) by default, not the browse client,
-    # to avoid rate-limit collisions with scan/fetch operations.
-    client = client or get_watcher_client()
+    client = client or get_client()
     if not client.is_connected:
         await client.start()
 

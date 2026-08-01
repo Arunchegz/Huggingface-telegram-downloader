@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import gradio as gr
+import spaces
 from pathlib import Path
 
 from database import init_db
@@ -12,22 +13,19 @@ from config import AUTO_DOWNLOAD, CHANNEL_REF
 
 init_db()
 
+@spaces.GPU
+def _dummy_gpu():
+    pass
+
 # ── async runner ──────────────────────────────────────────────────────────────
 
 def run_async(coro):
-    """Run a coroutine from sync context, even if an event loop is already running."""
     try:
-        loop = asyncio.get_running_loop()
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+        return loop.run_until_complete(coro)
     except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # Already inside an event loop (e.g. Gradio async worker) — run in thread
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, coro)
-            return future.result()
-    else:
         return asyncio.run(coro)
 
 # ── auto-downloader (background) ──────────────────────────────────────────────
@@ -149,8 +147,7 @@ def sync_chats_action():
     try:
         chats = run_async(fetch_chats())
         choices = chats_to_choices()
-        upd = gr.update(choices=choices)
-        return f"✅ Synced {len(chats)} chats.", upd, upd
+        return f"✅ Synced {len(chats)} chats.", gr.update(choices=choices), gr.update(choices=choices)
     except Exception as e:
         return f"❌ {e}", gr.update(), gr.update()
 
@@ -298,7 +295,6 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
         # ── Search ────────────────────────────────────────────────────────────
         with gr.TabItem("🔍 Search"):
             with gr.Row():
-                search_chat_dd = gr.Dropdown(label="Chat (optional)", choices=[("All", "")] + chats_to_choices(), value="", scale=2)
                 sq = gr.Textbox(label="Filename", scale=3)
                 st = gr.Dropdown(["all","video","audio","document","image","archive"],
                                  value="all", label="Type", scale=1)
@@ -352,12 +348,7 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
             btn_ref_r.click(load_recent, outputs=recent_html)
 
     # sync updates both chat dropdowns
-    def _sync_with_search():
-        msg, upd_browse, _ = sync_chats_action()
-        choices_with_all = [("All", "")] + chats_to_choices()
-        return msg, upd_browse, gr.update(choices=choices_with_all)
-
-    btn_sync.click(_sync_with_search, outputs=[sync_status, browse_chat_dd, search_chat_dd])
+    btn_sync.click(sync_chats_action, outputs=[sync_status, browse_chat_dd, browse_chat_dd])
     demo.load(load_recent, outputs=recent_html)
 
 if __name__ == "__main__":
