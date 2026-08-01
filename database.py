@@ -156,6 +156,23 @@ def finish_download(chat_id, message_id, status="done"):
         """, (datetime.utcnow().isoformat(), status, chat_id, message_id))
 
 
+def delete_file_row(chat_id: int, message_id: int) -> str | None:
+    """Delete DB row for (chat_id, message_id). Returns local_path if it had one."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT local_path FROM files WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id)
+        ).fetchone()
+        if row is None:
+            return None
+        local_path = row["local_path"]
+        conn.execute(
+            "DELETE FROM files WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id)
+        )
+    return local_path
+
+
 def recent_downloads(limit=20):
     with get_conn() as conn:
         return conn.execute("""

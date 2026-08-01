@@ -4,15 +4,17 @@ import os
 import re
 from pathlib import Path
 from datetime import datetime
-from pyrogram import Client
+from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, FileReferenceExpired
+from pyrogram.raw.types import UpdateDeleteChannelMessages, UpdateDeleteMessages
+from pyrogram.handlers import RawUpdateHandler
 
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
                     POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS,
                     MAX_CONCURRENT_DOWNLOADS)
-from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg
+from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg, delete_file_row
 from storage import get_cache_size
 
 _client: Client | None = None
@@ -474,6 +476,62 @@ async def _chat_from_invite(client: Client, ref: str):
     return -cid
 
 
+async def _handle_delete_update(client: Client, update, users, chats, status_cb=None):
+    """Pyrogram raw update handler — fires when messages are deleted in a channel."""
+    if isinstance(update, UpdateDeleteChannelMessages):
+        # Reconstruct Pyrogram-style channel peer ID
+        chat_id = int(f"-100{update.channel_id}")
+        msg_ids = update.messages
+    elif isinstance(update, UpdateDeleteMessages):
+        # Private/group messages: no channel_id in update, handle per stored rows
+        chat_id = None
+        msg_ids = update.messages
+    else:
+        return
+
+    for mid in msg_ids:
+        if chat_id is not None:
+            local_path = delete_file_row(chat_id, mid)
+            if local_path:
+                p = Path(local_path)
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except OSError as e:
+                        if status_cb:
+                            status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
+                        continue
+                if status_cb:
+                    status_cb(f"🗑 Deleted [{chat_id}/{mid}] {p.name}")
+        else:
+            # Try all chats for this message_id (rare: non-channel delete)
+            from database import get_conn
+            with get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT chat_id, local_path FROM files WHERE message_id=? AND downloaded=1",
+                    (mid,)
+                ).fetchall()
+            for row in rows:
+                local_path = delete_file_row(row["chat_id"], mid)
+                if local_path:
+                    p = Path(local_path)
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                    if status_cb:
+                        status_cb(f"🗑 Deleted [{row['chat_id']}/{mid}] {p.name}")
+
+
+def _register_delete_handler(client: Client, status_cb=None):
+    """Register raw update handler for message deletions on given client."""
+    async def _handler(c, update, users, chats):
+        await _handle_delete_update(c, update, users, chats, status_cb=status_cb)
+
+    client.add_handler(RawUpdateHandler(_handler))
+
+
 async def auto_download_main(status_cb=None) -> None:
     """Resolve CHANNEL_REF, download existing files, then watch for new ones."""
     if not os.environ.get("CHANNEL_REF"):
@@ -483,6 +541,10 @@ async def auto_download_main(status_cb=None) -> None:
     client = get_watcher_client()
     if not client.is_connected:
         await client.start()
+    # Register delete-sync handler before warming peers
+    _register_delete_handler(client, status_cb=status_cb)
+    if status_cb:
+        status_cb("🗑 Delete-sync handler registered")
     # Warm the watcher's peer storage so update handling and downloads
     # work for every chat the account follows.
     try:
