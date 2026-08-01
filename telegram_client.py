@@ -11,7 +11,7 @@ from pyrogram.errors import FloodWait, FileReferenceExpired
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
                     POLL_INTERVAL, MAX_CACHE_BYTES)
-from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download
+from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg
 from storage import get_cache_size
 
 _client: Client | None = None
@@ -141,10 +141,12 @@ async def download_file(
     message_id: int,
     file_name: str,
     progress_cb=None,
+    client: Client | None = None,
 ) -> Path | None:
     """Download file to DOWNLOAD_DIR. Returns local path or None on failure."""
-    await ensure_started()
-    client = get_client()
+    client = client or get_client()
+    if not client.is_connected:
+        await client.start()
 
     dest = DOWNLOAD_DIR / str(chat_id)
     dest.mkdir(parents=True, exist_ok=True)
@@ -246,6 +248,11 @@ def _save_last_msg_id(chat_id: int, msg_id: int):
         pass
 
 
+def _is_downloaded(chat_id: int, msg_id: int) -> bool:
+    row = get_file_by_msg(chat_id, msg_id)
+    return bool(row) and bool(row["downloaded"])
+
+
 def _cache_full(needed: int) -> bool:
     return get_cache_size() + needed > MAX_CACHE_BYTES
 
@@ -268,7 +275,7 @@ async def download_channel_all(
         if not meta:
             continue
         upsert_file(meta)
-        if msg.id <= last_id:
+        if msg.id <= last_id and _is_downloaded(chat_id, msg.id):
             continue
         if _cache_full(meta["file_size"]):
             if status_cb:
@@ -277,7 +284,7 @@ async def download_channel_all(
         if status_cb:
             status_cb(f"⬇ [{msg.id}] {meta['file_name']} ({meta['file_size']//1024//1024} MB)")
         try:
-            path = await download_file(chat_id, msg.id, meta["file_name"])
+            path = await download_file(chat_id, msg.id, meta["file_name"], client=client)
             if path:
                 count += 1
         except Exception as e:
@@ -319,7 +326,7 @@ async def watch_channel_new(
                         status_cb(f"Cache limit reached, skipping {meta['file_name']}")
                     continue
                 try:
-                    path = await download_file(chat_id, msg.id, meta["file_name"])
+                    path = await download_file(chat_id, msg.id, meta["file_name"], client=client)
                     if path and status_cb:
                         status_cb(f"⬇ NEW [{msg.id}] {meta['file_name']}")
                 except Exception as e:
@@ -381,6 +388,13 @@ async def auto_download_main(status_cb=None) -> None:
     client = get_watcher_client()
     if not client.is_connected:
         await client.start()
+    # Warm the watcher's peer storage so update handling and downloads
+    # work for every chat the account follows.
+    try:
+        async for _ in client.get_dialogs():
+            pass
+    except Exception:
+        pass
     ref = os.environ["CHANNEL_REF"].strip()
     if "t.me/" in ref:
         try:
