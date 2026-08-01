@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import gradio as gr
+import spaces
 from pathlib import Path
 
 from database import init_db
@@ -11,6 +12,10 @@ from database import get_chats, toggle_favorite, recent_downloads, get_file_by_m
 from config import AUTO_DOWNLOAD, CHANNEL_REF
 
 init_db()
+
+@spaces.GPU
+def _dummy_gpu():
+    pass
 
 # ── async runner ──────────────────────────────────────────────────────────────
 
