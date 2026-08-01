@@ -121,7 +121,12 @@ def _series_groups(files: list[dict]) -> dict:
 
 
 def _base_url(request: Request) -> str:
-    return BASE_URL or str(request.base_url).rstrip("/")
+    if BASE_URL:
+        return BASE_URL.rstrip("/")
+    url = str(request.base_url).rstrip("/")
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    return url
 
 
 # ── addon routes ──────────────────────────────────────────────────────────────
