@@ -15,6 +15,7 @@ from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS,
                     MAX_CONCURRENT_DOWNLOADS)
 from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg, delete_file_row
+from bucket import delete_bucket_file
 from storage import get_cache_size
 
 _client: Client | None = None
@@ -491,37 +492,41 @@ async def _handle_delete_update(client: Client, update, users, chats, status_cb=
 
     for mid in msg_ids:
         if chat_id is not None:
-            local_path = delete_file_row(chat_id, mid)
-            if local_path:
-                p = Path(local_path)
-                if p.exists():
+            info = delete_file_row(chat_id, mid)
+            if info:
+                local_path, file_name = info["local_path"], info["file_name"]
+                p = Path(local_path) if local_path else None
+                if p and p.exists():
                     try:
                         p.unlink()
                     except OSError as e:
                         if status_cb:
                             status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
                         continue
+                delete_bucket_file(chat_id, file_name)
                 if status_cb:
-                    status_cb(f"🗑 Deleted [{chat_id}/{mid}] {p.name}")
+                    status_cb(f"🗑 Deleted [{chat_id}/{mid}] {file_name}")
         else:
             # Try all chats for this message_id (rare: non-channel delete)
             from database import get_conn
             with get_conn() as conn:
                 rows = conn.execute(
-                    "SELECT chat_id, local_path FROM files WHERE message_id=? AND downloaded=1",
+                    "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND downloaded=1",
                     (mid,)
                 ).fetchall()
             for row in rows:
-                local_path = delete_file_row(row["chat_id"], mid)
-                if local_path:
-                    p = Path(local_path)
-                    if p.exists():
+                info = delete_file_row(row["chat_id"], mid)
+                if info:
+                    file_name = info["file_name"]
+                    p = Path(info["local_path"]) if info["local_path"] else None
+                    if p and p.exists():
                         try:
                             p.unlink()
                         except OSError:
                             pass
+                    delete_bucket_file(row["chat_id"], file_name)
                     if status_cb:
-                        status_cb(f"🗑 Deleted [{row['chat_id']}/{mid}] {p.name}")
+                        status_cb(f"🗑 Deleted [{row['chat_id']}/{mid}] {file_name}")
 
 
 def _register_delete_handler(client: Client, status_cb=None):

@@ -20,28 +20,29 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from config import DOWNLOAD_DIR
+from config import DOWNLOAD_DIR, TMDB_API_KEY
 from database import get_conn
 from storage import iter_file_chunks, resolve_local_path
 
 BASE_URL = os.environ.get("ADDON_BASE_URL", "").rstrip("/")
 STORAGE_BUCKET_BASE = os.environ.get("STORAGE_BUCKET_BASE", "").rstrip("/")
+OPENSUBTITLES_BASE = "https://opensubtitles-v3.strem.io"
 
 MOVIE_PREFIX = "tgdm:"
 SERIES_PREFIX = "tgds:"
 
 MANIFEST = {
     "id": "org.tgmanager.files",
-    "version": "1.1.0",
-    "name": "TG Manager Files",
-    "description": "Stream files downloaded by TG Manager from Telegram channels",
+    "version": "1.2.0",
+    "name": "TG Manager Files + Subtitles",
+    "description": "Stream files downloaded by TG Manager from Telegram channels, with OpenSubtitles v3 subtitles built in",
     "resources": ["catalog", "meta", "stream", "subtitles"],
     "types": ["movie", "series"],
-    "idPrefixes": ["tgdm:", "tgds:", "tt"],
     "catalogs": [
         {"type": "movie", "id": "tgmanager_movies", "name": "TG Downloaded Movies"},
         {"type": "series", "id": "tgmanager_series", "name": "TG Downloaded Series"},
     ],
+    "idPrefixes": ["tgdm:", "tgds:", "tt"],
 }
 
 
@@ -249,24 +250,100 @@ def _match_score(filename: str, title: str, year: str,
 MATCH_THRESHOLD = 35
 
 
-# ── Cinemeta helpers ──────────────────────────────────────────────────────────
+# ── TMDB + Cinemeta helpers ───────────────────────────────────────────────────
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/w500"
+
 
 def _placeholder_poster(title: str) -> str:
     return f"https://via.placeholder.com/300x450?text={quote_plus(title or 'No+Poster')}"
 
 
-async def _fetch_poster_and_imdb(filename: str) -> tuple[str, str]:
+def _tmdb_media(is_series: bool) -> str:
+    return "tv" if is_series else "movie"
+
+
+def _clean_alt_title(title: str) -> str:
+    title = re.sub(r"\s*[\(\[]?(?:19|20)\d{2}[\)\]]?\s*$", "", title.strip())
+    return title.strip()
+
+
+def _tmdb_result_year(r: dict) -> str:
+    return (r.get("release_date") or r.get("first_air_date") or "")[:4]
+
+
+async def _tmdb_search(filename: str) -> dict | None:
+    """TMDB search (primary): poster + imdb_id via external_ids + title candidates."""
+    if not TMDB_API_KEY:
+        return None
     is_series = bool(IS_SERIES_RE.search(filename))
     title = parse_show_title(filename) if is_series else parse_title_year(filename)[0]
     year = "" if is_series else parse_title_year(filename)[1]
-    catalog_type = "series" if is_series else "movie"
+    if not title:
+        return None
+    media = _tmdb_media(is_series)
+    params = {"api_key": TMDB_API_KEY, "query": title, "language": "en-US"}
+    if year:
+        params["first_air_date_year" if is_series else "year"] = year
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(f"{TMDB_BASE}/search/{media}", params=params)
+            results = r.json().get("results", [])
+            if not results:
+                return None
+            best = results[0]
+            if year:
+                exact = [res for res in results if _tmdb_result_year(res) == year]
+                if exact:
+                    best = exact[0]
+            tmdb_id = best["id"]
+            name = (best.get("title") or best.get("name")
+                    or best.get("original_title") or best.get("original_name") or title)
+            original = best.get("original_title") or best.get("original_name") or name
+            poster = ""
+            if best.get("poster_path"):
+                poster = f"{TMDB_IMG}{best['poster_path']}"
+            # external_ids → IMDB ID directly
+            imdb_id = ""
+            r2 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/external_ids",
+                             params={"api_key": TMDB_API_KEY})
+            imdb_id = r2.json().get("imdb_id") or ""
+            alt_titles = []
+            r3 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/alternative_titles",
+                             params={"api_key": TMDB_API_KEY})
+            entries = r3.json().get("titles") or r3.json().get("results") or []
+            for e in entries:
+                t = _clean_alt_title(e.get("title", ""))
+                if t and t.lower() not in {name.lower(), original.lower()}:
+                    alt_titles.append(t)
+            candidates = []
+            for t in [name, original] + alt_titles:
+                if t and t not in candidates:
+                    candidates.append(t)
+            return {"poster": poster, "imdb_id": imdb_id,
+                    "title": name, "candidates": candidates}
+    except Exception as e:
+        print(f"[tmdb] search failed for {filename!r}: {e}")
+    return None
+
+
+async def _fetch_poster_and_imdb(filename: str) -> tuple[str, str]:
+    """TMDB search (primary) → poster + imdb_id; Cinemeta search as fallback."""
+    is_series = bool(IS_SERIES_RE.search(filename))
+    title = parse_show_title(filename) if is_series else parse_title_year(filename)[0]
     if not title:
         return _placeholder_poster(""), ""
+    tmdb = await _tmdb_search(filename)
+    if tmdb and (tmdb["poster"] or tmdb["imdb_id"]):
+        return tmdb["poster"] or _placeholder_poster(title), tmdb["imdb_id"]
+    year = "" if is_series else parse_title_year(filename)[1]
     query = quote_plus(f"{title} {year}".strip())
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(
-                f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json"
+                f"https://v3-cinemeta.strem.io/catalog/"
+                f"{'series' if is_series else 'movie'}/top/search={query}.json"
             )
             metas = r.json().get("metas", [])
             if metas:
@@ -290,16 +367,68 @@ async def get_poster_and_imdb(filename: str) -> tuple[str, str]:
     return poster, imdb_id
 
 
-async def get_cinemeta(type_name: str, imdb_id: str) -> tuple[str, str]:
-    """Returns (title, year) from Cinemeta for a tt ID."""
+async def get_title_info(type_name: str, imdb_id: str) -> tuple[str, str, list[str]]:
+    """Returns (name, year, candidate_titles) for a tt ID.
+
+    TMDB find is primary (localized + original_title + alternative_titles);
+    Cinemeta is the fallback.
+    """
+    if not imdb_id.startswith("tt"):
+        return "", "", []
+    if TMDB_API_KEY:
+        media = _tmdb_media(type_name == "series")
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(f"{TMDB_BASE}/find/{imdb_id}",
+                                params={"api_key": TMDB_API_KEY,
+                                        "external_source": "imdb_id"})
+                results = r.json().get("movie_results") or r.json().get("tv_results") or []
+                if results:
+                    best = results[0]
+                    tmdb_id = best["id"]
+                    name = best.get("title") or best.get("name") or ""
+                    original = best.get("original_title") or best.get("original_name") or name
+                    year = _tmdb_result_year(best)
+                    candidates = []
+                    for t in [name, original]:
+                        if t and t not in candidates:
+                            candidates.append(t)
+                    try:
+                        r2 = await c.get(
+                            f"{TMDB_BASE}/{media}/{tmdb_id}/alternative_titles",
+                            params={"api_key": TMDB_API_KEY})
+                        entries = r2.json().get("titles") or r2.json().get("results") or []
+                        known = {c.lower() for c in candidates}
+                        for e in entries:
+                            t = _clean_alt_title(e.get("title", ""))
+                            if t and t.lower() not in known:
+                                candidates.append(t)
+                                known.add(t.lower())
+                    except Exception as e:
+                        print(f"[tmdb] alt titles failed for {imdb_id}: {e}")
+                    return name or original, year, candidates
+        except Exception as e:
+            print(f"[tmdb] find failed for {imdb_id}: {e}")
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json")
             meta = r.json().get("meta", {}) or {}
-            return meta.get("name", ""), str(meta.get("year", "") or "")
+            name = meta.get("name", "")
+            return name, str(meta.get("year", "") or ""), [name] if name else []
     except Exception as e:
         print(f"[cinemeta] failed for {imdb_id}: {e}")
-    return "", ""
+    return "", "", []
+
+
+def _match_any(filename: str, titles: list[str], year: str,
+               season: int | None, episode: int | None) -> int:
+    for t in titles:
+        if not t:
+            continue
+        score = _match_score(filename, t, year, season, episode)
+        if score >= MATCH_THRESHOLD:
+            return score
+    return 0
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -379,9 +508,9 @@ def add_routes(app: FastAPI):
     async def meta(type: str, item_id: str):
         files = _downloaded_files()
 
-        # ── tt IMDB ID: return Cinemeta meta + matched videos ──────────────
+        # ── tt IMDB ID: return meta + matched videos ──────────────────────
         if item_id.startswith("tt"):
-            title, year = await get_cinemeta(type, item_id)
+            title, year, title_candidates = await get_title_info(type, item_id)
             if not title:
                 return JSONResponse({"meta": None})
             meta_obj: dict = {"id": item_id, "type": type, "name": title, "year": year}
@@ -392,7 +521,7 @@ def add_routes(app: FastAPI):
                 for f in files:
                     fn = f["file_name"]
                     fs, fe = _parse_season_episode(fn)
-                    score = _match_score(fn, title, year, fs, fe)
+                    score = _match_any(fn, title_candidates, year, fs, fe)
                     if score >= MATCH_THRESHOLD:
                         scored.append((score, f, fs or 1, fe or 1))
                 scored.sort(key=lambda x: x[0], reverse=True)
@@ -462,13 +591,13 @@ def add_routes(app: FastAPI):
             imdb_id = parts[0]
             season = int(parts[1]) if len(parts) > 1 else None
             episode = int(parts[2]) if len(parts) > 2 else None
-            title, year = await get_cinemeta(type, imdb_id)
+            title, year, title_candidates = await get_title_info(type, imdb_id)
             if not title:
                 return JSONResponse({"streams": []})
             scored = []
             for f in files:
                 fn = f["file_name"]
-                score = _match_score(fn, title, year, season, episode)
+                score = _match_any(fn, title_candidates, year, season, episode)
                 if score >= MATCH_THRESHOLD:
                     scored.append((score, f))
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -529,10 +658,10 @@ def add_routes(app: FastAPI):
             season = int(parts[1]) if len(parts) > 1 else None
             episode = int(parts[2]) if len(parts) > 2 else None
             # Find filename for IMDB-keyed requests
-            title, year = await get_cinemeta(type, imdb_id)
+            title, year, title_candidates = await get_title_info(type, imdb_id)
             if title:
                 for f in files:
-                    score = _match_score(f["file_name"], title, year, season, episode)
+                    score = _match_any(f["file_name"], title_candidates, year, season, episode)
                     if score >= MATCH_THRESHOLD:
                         filename = f["file_name"]
                         break
@@ -540,7 +669,7 @@ def add_routes(app: FastAPI):
             os_id = imdb_id if type == "movie" else f"{imdb_id}:{season}:{episode}"
             try:
                 async with httpx.AsyncClient(timeout=10) as c:
-                    r = await c.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
+                    r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
                     if r.status_code == 200:
                         return JSONResponse(r.json())
             except Exception as e:

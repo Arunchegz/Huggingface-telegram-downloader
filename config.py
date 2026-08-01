@@ -27,6 +27,14 @@ EXTRA_TOKENS = [
     t.strip() for t in os.environ.get("EXTRA_TOKENS", "").split(",") if t.strip()
 ]
 
+# TMDB (posters, IMDB IDs, title matching for the Stremio addon)
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+
+# HF bucket (external repo holding uploaded files for streaming)
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
+STORAGE_BUCKET_REPO = os.environ.get("STORAGE_BUCKET_REPO", "").strip()  # e.g. "arunchez/TGmanager"
+STORAGE_BUCKET_TYPE = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()  # space | dataset | model
+
 # Limits
 MAX_CACHE_GB = float(os.environ.get("MAX_CACHE_GB", "10"))
 MAX_CACHE_BYTES = MAX_CACHE_GB * 1024 ** 3
