@@ -406,7 +406,7 @@ async def auto_download_main(status_cb=None) -> None:
     if status_cb:
         status_cb(f"📡 Channel: {row['title']} (ID {row['id']})")
 
-    async def _status(s):
+    def _status(s):
         if status_cb:
             status_cb(s)
 
