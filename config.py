@@ -19,6 +19,7 @@ CHANNEL_REF = os.environ.get("CHANNEL_REF", "").strip()
 AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
 INITIAL_SCAN_LIMIT = int(os.environ.get("INITIAL_SCAN_LIMIT", "500"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "1"))
 
 # Extra download sessions (comma-separated): bot tokens or session strings.
 # Each session has its own rate limits -> spreads GetFile flood waits.

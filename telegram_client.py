@@ -10,7 +10,8 @@ from pyrogram.errors import FloodWait, FileReferenceExpired
 
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
-                    POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS)
+                    POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS,
+                    MAX_CONCURRENT_DOWNLOADS)
 from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg
 from storage import get_cache_size
 
@@ -339,7 +340,7 @@ async def download_channel_all(
     if status_cb:
         status_cb(f"🎯 {len(pending)} files to download (clients: {len(dl_clients)})")
 
-    sem = asyncio.Semaphore(1)
+    sem = asyncio.Semaphore(min(MAX_CONCURRENT_DOWNLOADS, len(dl_clients)))
     counter = {"n": 0}
     lock = asyncio.Lock()
 
@@ -405,7 +406,7 @@ async def watch_channel_new(
                 _save_last_msg_id(chat_id, last_id)
 
             if pending:
-                sem = asyncio.Semaphore(1)
+                sem = asyncio.Semaphore(min(MAX_CONCURRENT_DOWNLOADS, len(dl_clients)))
                 counter = {"n": 0}
                 lock = asyncio.Lock()
 
