@@ -41,6 +41,8 @@ def start_auto_downloader():
         try:
             asyncio.run(auto_download_main(status_cb=_status))
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"[auto] FATAL: {e}")
 
     t = threading.Thread(target=_run, daemon=True, name="auto-downloader")

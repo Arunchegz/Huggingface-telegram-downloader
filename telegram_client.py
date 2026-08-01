@@ -200,10 +200,19 @@ async def resolve_chat(ref: str) -> dict:
     await ensure_started()
     client = get_client()
     ref = ref.strip()
-    if ref.lstrip("-").isdigit():
+    if "t.me/" in ref:
+        try:
+            chat = await client.get_chat(ref)
+            if not getattr(chat, "id", None):
+                raise ValueError(f"not a member yet: {ref}")
+        except Exception:
+            try:
+                chat = await client.join_chat(ref)
+            except Exception:
+                pass
+            chat = await client.get_chat(ref)
+    elif ref.lstrip("-").isdigit():
         chat = await client.get_chat(int(ref))
-    elif "t.me/" in ref:
-        chat = await client.join_chat(ref)
     else:
         chat = await client.get_chat(ref.lstrip("@"))
     row = {
@@ -344,13 +353,22 @@ async def _chat_from_invite(client: Client, ref: str):
     if raw is None:
         for raw in getattr(res, "chats", []) or []:
             break
-    if raw is None:
-        return None
-    cid = getattr(raw, "id", None)
+    if raw is not None:
+        try:
+            await client.fetch_peers([raw])
+        except Exception:
+            pass
+        cid = getattr(raw, "id", None)
+        if cid is None:
+            return None
+        if getattr(raw, "channel", False) or getattr(raw, "megagroup", False):
+            return -1000000000000 - cid
+        return -cid
+    cid = getattr(res, "chat_id", None)
     if cid is None:
         return None
-    if getattr(raw, "channel", False) or getattr(raw, "megagroup", False):
-        return int(f"-100{cid}")
+    if getattr(res, "channel", False) or getattr(res, "broadcast", False):
+        return -1000000000000 - cid
     return -cid
 
 
@@ -366,12 +384,15 @@ async def auto_download_main(status_cb=None) -> None:
     ref = os.environ["CHANNEL_REF"].strip()
     if "t.me/" in ref:
         try:
-            chat = await client.join_chat(ref)
+            chat = await client.get_chat(ref)
+            if not getattr(chat, "id", None):
+                raise ValueError(f"not a member yet: {ref}")
         except Exception:
-            cid = await _chat_from_invite(client, ref)
-            if cid is None:
-                raise
-            chat = await client.get_chat(cid)
+            try:
+                chat = await client.join_chat(ref)
+            except Exception:
+                pass
+            chat = await client.get_chat(ref)
     else:
         chat = await client.get_chat(ref.lstrip("@") if not ref.lstrip("-").isdigit() else int(ref))
     row = {
