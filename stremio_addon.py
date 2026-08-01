@@ -160,6 +160,20 @@ def _clean_title_prefix(filename: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+def _levenshtein_similarity(a: str, b: str) -> float:
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return 1.0 if not a else 0.0
+    prev = list(range(len(b) + 1))
+    for ca in a:
+        curr = [prev[0] + 1]
+        for j, cb in enumerate(b):
+            curr.append(min(prev[j + 1] + 1, curr[-1] + 1, prev[j] + (0 if ca == cb else 1)))
+        prev = curr
+    return 1 - prev[-1] / max(len(a), len(b))
+
+
 def _matches_title(filename: str, title: str) -> bool:
     prefix = _clean_title_prefix(filename)
     norm_title = _normalize_title(title)
@@ -168,6 +182,19 @@ def _matches_title(filename: str, title: str) -> bool:
         return False
     if norm_title == norm_prefix or norm_title in norm_prefix:
         return True
+    # Compact-space: handles dots splitting a word ("Pallichat.Tambi" → "pallichattambi")
+    compact_title = norm_title.replace(" ", "")
+    compact_prefix = norm_prefix.replace(" ", "")
+    if compact_title and (compact_title == compact_prefix
+                          or compact_title in compact_prefix
+                          or compact_prefix in compact_title):
+        return True
+    # Fuzzy single-word title: spelling variants ("Pallicchattambi" vs "Pallichattambi")
+    if len(norm_title.split()) == 1 and len(compact_title) >= 6:
+        sim = _levenshtein_similarity(compact_title, compact_prefix.split()[0] if compact_prefix else "")
+        if sim >= 0.85:
+            return True
+    # Keyword overlap
     title_words = set(norm_title.split()) - _STOPWORDS or set(norm_title.split())
     prefix_words = set(norm_prefix.split())
     if not title_words:
