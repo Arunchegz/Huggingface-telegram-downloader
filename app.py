@@ -303,102 +303,53 @@ JS_HIDDEN = """
 """
 
 with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 📁 TGFiles — Telegram File Browser")
     gr.HTML(JS_HIDDEN)
 
-    with gr.Tabs():
-
-        # ── Account ──────────────────────────────────────────────────────────
-        with gr.TabItem("👤 Account"):
-            acct_box = gr.Textbox(label="Account", interactive=False)
-            with gr.Row():
-                btn_me   = gr.Button("Load Info")
-                btn_sync = gr.Button("🔄 Sync Chats", variant="primary")
-            sync_status = gr.Textbox(label="Status", interactive=False)
-            btn_me.click(load_account_info, outputs=acct_box)
-
-        # ── Browse ────────────────────────────────────────────────────────────
-        with gr.TabItem("📂 Browse"):
-            with gr.Row():
-                browse_chat_dd = gr.Dropdown(label="Chat", choices=chats_to_choices(), scale=3)
-                type_dd = gr.Dropdown(["all","video","audio","document","image","archive"],
-                                      value="all", label="Type", scale=1)
-            with gr.Row():
-                btn_browse = gr.Button("📂 Browse", variant="primary")
-                scan_limit = gr.Slider(50, 1000, value=200, step=50, label="Scan limit")
-                btn_scan   = gr.Button("🔍 Scan")
-                btn_fav    = gr.Button("⭐ Fav")
-            browse_status = gr.Textbox(label="", interactive=False, show_label=False)
-            browse_html   = gr.HTML()
-
-            btn_browse.click(browse_chat, [browse_chat_dd, type_dd], [browse_html, browse_status])
-            btn_scan.click(scan_chat_action, [browse_chat_dd, scan_limit], browse_status)
-            btn_fav.click(toggle_fav_action, browse_chat_dd, [browse_status, browse_chat_dd])
-
-        # ── Search ────────────────────────────────────────────────────────────
-        with gr.TabItem("🔍 Search"):
-            with gr.Row():
-                search_chat_dd = gr.Dropdown(label="Chat (optional)", choices=[("All", "")] + chats_to_choices(), value="", scale=2)
-                sq = gr.Textbox(label="Filename", scale=3)
-                st = gr.Dropdown(["all","video","audio","document","image","archive"],
+    with gr.Row():
+        chat_dd   = gr.Dropdown(label="Chat", choices=chats_to_choices(), scale=4)
+        type_dd   = gr.Dropdown(["all","video","audio","document","image","archive"],
                                  value="all", label="Type", scale=1)
-            with gr.Row():
-                smin = gr.Number(label="Min MB", value=0, precision=1)
-                smax = gr.Number(label="Max MB", value=0, precision=1)
-                sdf  = gr.Textbox(label="From (YYYY-MM-DD)")
-                sdt  = gr.Textbox(label="To (YYYY-MM-DD)")
-            sc_only      = gr.Checkbox(label="Cached only")
-            btn_search   = gr.Button("Search", variant="primary")
-            search_count = gr.Textbox(label="", interactive=False)
-            search_html  = gr.HTML()
-            with gr.Row():
-                ssel_chat = gr.Textbox(label="Chat ID")
-                ssel_msg  = gr.Textbox(label="Msg ID")
-            btn_dl_s    = gr.Button("⬇ Download", variant="primary")
-            dl_status_s = gr.Textbox(label="Status", interactive=False)
+        btn_sync  = gr.Button("🔄", scale=0, min_width=48)
+        btn_scan  = gr.Button("⚡ Scan", scale=0, min_width=80)
+        scan_limit = gr.Slider(50, 1000, value=200, step=50, label="Limit", scale=1)
 
-            btn_search.click(do_search, [sq,st,smin,smax,sdf,sdt,sc_only], [search_html, search_count])
-            btn_dl_s.click(start_download_action, [ssel_chat, ssel_msg], dl_status_s)
+    status_bar = gr.Textbox(label="", interactive=False, show_label=False, max_lines=1)
+    file_html  = gr.HTML()
 
-        # ── Manual Download ───────────────────────────────────────────────────
-        with gr.TabItem("⬇ Download"):
-            gr.Markdown("Enter Chat ID + Message ID from Browse/Search.")
-            with gr.Row():
-                ch_name = gr.Textbox(label="Channel (@username / invite link / ID)", scale=3)
-                btn_res = gr.Button("🔎 Load Channel")
-            ch_status = gr.Textbox(label="", interactive=False)
-            with gr.Row():
-                dl_chat = gr.Textbox(label="Chat ID")
-                dl_msg  = gr.Textbox(label="Message ID")
-            btn_dl = gr.Button("⬇ Download", variant="primary")
-            dl_out = gr.Textbox(label="Status", interactive=False)
-            btn_dl.click(start_download_action, [dl_chat, dl_msg], dl_out)
-            btn_res.click(resolve_chat_action, ch_name, [ch_status, dl_chat, browse_chat_dd])
+    def do_browse(chat_id_str, media_type, request: gr.Request = None):
+        if not chat_id_str:
+            return "", "<p style='color:#888'>Select a chat to browse.</p>"
+        try:
+            rows = search_files(chat_id=int(chat_id_str), media_type=media_type, limit=500)
+            counts = get_type_counts(int(chat_id_str))
+            summary = "  ".join(f"{k} {v}" for k, v in counts.items() if v > 0)
+            base = ""
+            if request:
+                base = f"{request.request.url.scheme}://{request.request.url.netloc}"
+            return f"{len(rows)} files  |  {summary}", rows_to_html(rows, base_url=base)
+        except Exception as e:
+            return f"❌ {e}", ""
 
-        # ── Storage ───────────────────────────────────────────────────────────
-        with gr.TabItem("💾 Storage"):
-            btn_ref_s  = gr.Button("🔄 Refresh")
-            store_info = gr.Textbox(label="Cache Info", lines=2, interactive=False)
-            store_html = gr.HTML()
-            btn_clr    = gr.Button("🗑️ Clear All", variant="stop")
-            clr_status = gr.Textbox(label="", interactive=False)
-            btn_ref_s.click(load_storage, outputs=[store_info, store_html])
-            btn_clr.click(clear_all_action, outputs=clr_status)
+    def do_sync(request: gr.Request = None):
+        try:
+            chats = run_async(fetch_chats())
+            return f"✅ Synced {len(chats)} chats.", gr.update(choices=chats_to_choices())
+        except Exception as e:
+            return f"❌ {e}", gr.update()
 
-        # ── Recent ────────────────────────────────────────────────────────────
-        with gr.TabItem("🕓 Recent"):
-            btn_ref_r    = gr.Button("🔄 Refresh")
-            recent_html  = gr.HTML()
-            btn_ref_r.click(load_recent, outputs=recent_html)
+    def do_scan(chat_id_str, limit):
+        if not chat_id_str:
+            return "Select a chat first."
+        try:
+            count = run_async(scan_chat(int(chat_id_str), limit=int(limit)))
+            return f"✅ Indexed {count} files."
+        except Exception as e:
+            return f"❌ {e}"
 
-    # sync updates both chat dropdowns
-    def _sync_with_search():
-        msg, upd_browse, _ = sync_chats_action()
-        choices_with_all = [("All", "")] + chats_to_choices()
-        return msg, upd_browse, gr.update(choices=choices_with_all)
-
-    btn_sync.click(_sync_with_search, outputs=[sync_status, browse_chat_dd, search_chat_dd])
-    demo.load(load_recent, outputs=recent_html)
+    btn_sync.click(do_sync, outputs=[status_bar, chat_dd])
+    btn_scan.click(do_scan, [chat_dd, scan_limit], status_bar)
+    chat_dd.change(do_browse, [chat_dd, type_dd], [status_bar, file_html])
+    type_dd.change(do_browse, [chat_dd, type_dd], [status_bar, file_html])
 
 if __name__ == "__main__":
     import os
