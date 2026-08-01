@@ -328,6 +328,31 @@ async def watch_channel_new(
         await asyncio.sleep(interval)
 
 
+async def _chat_from_invite(client: Client, ref: str):
+    """Resolve chat id from a t.me invite link without requiring a join."""
+    m = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", ref)
+    if not m:
+        return None
+    try:
+        from pyrogram.raw import functions
+
+        res = await client.invoke(functions.messages.CheckChatInvite(hash=m.group(1)))
+    except Exception:
+        return None
+    raw = getattr(res, "chat", None)
+    if raw is None:
+        for raw in getattr(res, "chats", []) or []:
+            break
+    if raw is None:
+        return None
+    cid = getattr(raw, "id", None)
+    if cid is None:
+        return None
+    if getattr(raw, "channel", False) or getattr(raw, "megagroup", False):
+        return int(f"-100{cid}")
+    return -cid
+
+
 async def auto_download_main(status_cb=None) -> None:
     """Resolve CHANNEL_REF, download existing files, then watch for new ones."""
     if not os.environ.get("CHANNEL_REF"):
@@ -339,7 +364,13 @@ async def auto_download_main(status_cb=None) -> None:
         await client.start()
     ref = os.environ["CHANNEL_REF"].strip()
     if "t.me/" in ref:
-        chat = await client.join_chat(ref)
+        try:
+            chat = await client.join_chat(ref)
+        except Exception:
+            cid = await _chat_from_invite(client, ref)
+            if cid is None:
+                raise
+            chat = await client.get_chat(cid)
     else:
         chat = await client.get_chat(ref.lstrip("@") if not ref.lstrip("-").isdigit() else int(ref))
     row = {
