@@ -312,11 +312,10 @@ async def download_channel_all(
     client = client or get_client()
     if not client.is_connected:
         await client.start()
-    count = 0
     last_id = get_last_msg_id(chat_id)
     dl_clients = get_download_clients()
-    dl_idx = 0
 
+    pending = []
     async for msg in client.get_chat_history(chat_id, limit=limit):
         meta = _extract_file_meta(msg)
         if not meta:
@@ -328,22 +327,44 @@ async def download_channel_all(
             if status_cb:
                 status_cb(f"Cache limit reached, stopping at {meta['file_name']}")
             break
-        if status_cb:
-            status_cb(f"⬇ [{msg.id}] {meta['file_name']} ({meta['file_size']//1024//1024} MB)")
-        try:
-            dl_client = dl_clients[dl_idx % len(dl_clients)]
-            dl_idx += 1
-            path = await download_file(chat_id, msg.id, meta["file_name"], client=dl_client)
-            if path:
-                count += 1
-        except Exception as e:
-            if status_cb:
-                status_cb(f"⚠ [{msg.id}] {meta['file_name']}: {e}")
+        pending.append(meta)
         last_id = max(last_id, msg.id)
         await asyncio.sleep(0)
 
     _save_last_msg_id(chat_id, last_id)
-    return count
+
+    if not pending:
+        return 0
+
+    if status_cb:
+        status_cb(f"🎯 {len(pending)} files to download (clients: {len(dl_clients)})")
+
+    sem = asyncio.Semaphore(len(dl_clients))
+    counter = {"n": 0}
+    lock = asyncio.Lock()
+
+    async def _one(meta: dict) -> bool:
+        async with sem:
+            try:
+                if _cache_full(meta["file_size"]):
+                    return False
+                async with lock:
+                    idx = counter["n"] % len(dl_clients)
+                    counter["n"] += 1
+                dl_client = dl_clients[idx]
+                if status_cb:
+                    status_cb(f"⬇ [{meta['message_id']}] {meta['file_name']} "
+                              f"({meta['file_size']//1024//1024} MB) @ {dl_client.name}")
+                path = await download_file(chat_id, meta["message_id"],
+                                           meta["file_name"], client=dl_client)
+                return path is not None
+            except Exception as e:
+                if status_cb:
+                    status_cb(f"⚠ [{meta['message_id']}] {meta['file_name']}: {e}")
+                return False
+
+    results = await asyncio.gather(*[_one(m) for m in pending])
+    return sum(1 for r in results if r)
 
 
 async def watch_channel_new(
@@ -364,7 +385,7 @@ async def watch_channel_new(
         try:
             newest_id = last_id
             dl_clients = get_download_clients()
-            dl_idx = 0
+            pending = []
             async for msg in client.get_chat_history(chat_id, limit=50):
                 meta = _extract_file_meta(msg)
                 if not meta:
@@ -376,20 +397,38 @@ async def watch_channel_new(
                     if status_cb:
                         status_cb(f"Cache limit reached, skipping {meta['file_name']}")
                     continue
-                try:
-                    dl_client = dl_clients[dl_idx % len(dl_clients)]
-                    dl_idx += 1
-                    path = await download_file(chat_id, msg.id, meta["file_name"], client=dl_client)
-                    if path and status_cb:
-                        status_cb(f"⬇ NEW [{msg.id}] {meta['file_name']}")
-                except Exception as e:
-                    if status_cb:
-                        status_cb(f"⚠ NEW [{msg.id}] {meta['file_name']}: {e}")
+                pending.append(meta)
                 newest_id = max(newest_id, msg.id)
                 await asyncio.sleep(0)
             if newest_id > last_id:
                 last_id = newest_id
                 _save_last_msg_id(chat_id, last_id)
+
+            if pending:
+                sem = asyncio.Semaphore(len(dl_clients))
+                counter = {"n": 0}
+                lock = asyncio.Lock()
+
+                async def _one(meta: dict):
+                    async with sem:
+                        try:
+                            async with lock:
+                                idx = counter["n"] % len(dl_clients)
+                                counter["n"] += 1
+                            dl_client = dl_clients[idx]
+                            if status_cb:
+                                status_cb(f"⬇ NEW [{meta['message_id']}] {meta['file_name']} "
+                                          f"@ {dl_client.name}")
+                            path = await download_file(
+                                chat_id, meta["message_id"], meta["file_name"],
+                                client=dl_client)
+                            if path and status_cb:
+                                status_cb(f"✅ NEW [{meta['message_id']}] {meta['file_name']}")
+                        except Exception as e:
+                            if status_cb:
+                                status_cb(f"⚠ NEW [{meta['message_id']}] {meta['file_name']}: {e}")
+
+                await asyncio.gather(*[_one(m) for m in pending])
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
