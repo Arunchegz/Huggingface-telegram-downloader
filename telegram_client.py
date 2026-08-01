@@ -176,6 +176,28 @@ async def download_file(
     return None
 
 
+async def resolve_chat(ref: str) -> dict:
+    """Resolve a chat by @username, invite link, or numeric id."""
+    await ensure_started()
+    client = get_client()
+    ref = ref.strip()
+    if ref.lstrip("-").isdigit():
+        chat = await client.get_chat(int(ref))
+    elif "t.me/" in ref:
+        chat = await client.join_chat(ref)
+    else:
+        chat = await client.get_chat(ref.lstrip("@"))
+    row = {
+        "id": chat.id,
+        "title": chat.title or chat.first_name or str(chat.id),
+        "type": str(chat.type),
+        "username": chat.username or "",
+        "last_synced": datetime.utcnow().isoformat(),
+    }
+    upsert_chat(row)
+    return row
+
+
 async def get_me() -> dict:
     await ensure_started()
     me = await get_client().get_me()

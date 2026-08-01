@@ -6,7 +6,7 @@ from pathlib import Path
 from database import init_db
 from search import search_files, get_type_counts, get_chat_file_stats, enrich_file_row, fmt_size
 from storage import get_storage_stats, clear_all_cache
-from telegram_client import fetch_chats, scan_chat, download_file, get_me
+from telegram_client import fetch_chats, scan_chat, download_file, get_me, resolve_chat
 from database import get_chats, toggle_favorite, recent_downloads, get_file_by_msg
 
 init_db()
@@ -191,6 +191,19 @@ def start_download_action(chat_id_str, msg_id_str):
     except Exception as e:
         return f"❌ {e}"
 
+def resolve_chat_action(ref):
+    if not ref or not ref.strip():
+        return "Enter @username, invite link, or chat ID.", gr.update(), gr.update()
+    try:
+        chat = run_async(resolve_chat(ref.strip()))
+        return (
+            f"✅ Resolved: {chat['title']} → ID {chat['id']}",
+            str(chat["id"]),
+            gr.update(choices=chats_to_choices()),
+        )
+    except Exception as e:
+        return f"❌ {e}", "", gr.update()
+
 # ── storage ───────────────────────────────────────────────────────────────────
 
 def load_storage():
@@ -283,11 +296,16 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
         with gr.TabItem("⬇ Download"):
             gr.Markdown("Enter Chat ID + Message ID from Browse/Search.")
             with gr.Row():
+                ch_name = gr.Textbox(label="Channel (@username / invite link / ID)", scale=3)
+                btn_res = gr.Button("🔎 Load Channel")
+            ch_status = gr.Textbox(label="", interactive=False)
+            with gr.Row():
                 dl_chat = gr.Textbox(label="Chat ID")
                 dl_msg  = gr.Textbox(label="Message ID")
             btn_dl = gr.Button("⬇ Download", variant="primary")
             dl_out = gr.Textbox(label="Status", interactive=False)
             btn_dl.click(start_download_action, [dl_chat, dl_msg], dl_out)
+            btn_res.click(resolve_chat_action, ch_name, [ch_status, dl_chat, browse_chat_dd])
 
         # ── Storage ───────────────────────────────────────────────────────────
         with gr.TabItem("💾 Storage"):
