@@ -5,13 +5,18 @@ Endpoints:
   /catalog/{type}/{id}.json
   /meta/{type}/{id}.json
   /stream/{type}/{id}.json
+  /subtitles/{type}/{id}.json
   /tgfile/{chat_id}/{message_id}   (HTTP Range streaming)
 """
 import mimetypes
 import os
 import re
+import time
 import urllib.parse
+from urllib.parse import quote_plus
+import xml.sax.saxutils as saxutils
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -30,7 +35,7 @@ MANIFEST = {
     "version": "1.0.0",
     "name": "TG Manager Files",
     "description": "Stream files downloaded by TG Manager from Telegram channels",
-    "resources": ["catalog", "meta", "stream"],
+    "resources": ["catalog", "meta", "stream", "subtitles"],
     "types": ["movie", "series"],
     "catalogs": [
         {"type": "movie", "id": "tgmanager_movies", "name": "TG Downloaded Movies"},
@@ -39,7 +44,24 @@ MANIFEST = {
 }
 
 
-# ── title parsing (mirrors Telegram-direct-addon/state.py) ────────────────────
+# ── in-memory poster/imdb cache (TTL 24h, no Redis dependency) ───────────────
+
+_cache: dict[str, tuple[float, str, str]] = {}  # key -> (expire_ts, poster, imdb_id)
+_CACHE_TTL = 86400
+
+
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and entry[0] > time.time():
+        return entry[1], entry[2]
+    return None, None
+
+
+def _cache_set(key: str, poster: str, imdb_id: str):
+    _cache[key] = (time.time() + _CACHE_TTL, poster, imdb_id)
+
+
+# ── title parsing (mirrors Telegram-direct-addon/state.py) ───────────────────
 
 def parse_title_year(filename: str) -> tuple[str, str]:
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
@@ -96,6 +118,57 @@ def parse_show_title(filename: str) -> str:
 
 def show_id(filename: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", parse_show_title(filename).lower())
+
+
+def _cache_key(filename: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", filename.lower())[:64]
+
+
+# ── Cinemeta / poster / IMDB lookup ──────────────────────────────────────────
+
+def _placeholder_poster(title: str) -> str:
+    return f"https://via.placeholder.com/300x450?text={quote_plus(title or 'No+Poster')}"
+
+
+async def _fetch_poster_and_imdb(filename: str) -> tuple[str, str]:
+    is_series = bool(IS_SERIES_RE.search(filename))
+    if is_series:
+        title = parse_show_title(filename)
+        year = ""
+        catalog_type = "series"
+    else:
+        title, year = parse_title_year(filename)
+        catalog_type = "movie"
+
+    if not title:
+        return _placeholder_poster(""), ""
+
+    query = quote_plus(f"{title} {year}".strip())
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(
+                f"https://v3-cinemeta.strem.io/catalog/{catalog_type}/top/search={query}.json"
+            )
+            metas = r.json().get("metas", [])
+            if metas:
+                poster = metas[0].get("poster") or _placeholder_poster(title)
+                imdb_id = metas[0].get("id", "")
+                if not imdb_id.startswith("tt"):
+                    imdb_id = ""
+                return poster, imdb_id
+    except Exception as e:
+        print(f"[poster] cinemeta failed for {filename!r}: {e}")
+    return _placeholder_poster(title), ""
+
+
+async def get_poster_and_imdb(filename: str) -> tuple[str, str]:
+    key = _cache_key(filename)
+    poster, imdb_id = _cache_get(key)
+    if poster is not None:
+        return poster, imdb_id
+    poster, imdb_id = await _fetch_poster_and_imdb(filename)
+    _cache_set(key, poster, imdb_id)
+    return poster, imdb_id
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -155,18 +228,20 @@ def add_routes(app: FastAPI):
                 if IS_SERIES_RE.search(f["file_name"]):
                     continue
                 title, year = parse_title_year(f["file_name"])
+                poster, _ = await get_poster_and_imdb(f["file_name"])
                 metas.append({
                     "id": f"{MOVIE_PREFIX}{f['chat_id']}:{f['message_id']}",
                     "type": "movie", "name": title or f["file_name"], "year": year,
-                    "poster": "https://via.placeholder.com/300x450?text=No+Poster",
+                    "poster": poster,
                     "posterShape": "poster",
                 })
         else:
             for sid, g in _series_groups(files).items():
+                poster, _ = await get_poster_and_imdb(g["files"][0]["file_name"])
                 metas.append({
                     "id": f"{SERIES_PREFIX}{sid}",
                     "type": "series", "name": g["title"],
-                    "poster": "https://via.placeholder.com/300x450?text=No+Poster",
+                    "poster": poster,
                     "posterShape": "poster",
                 })
         return JSONResponse({"metas": metas})
@@ -180,11 +255,15 @@ def add_routes(app: FastAPI):
             for f in files:
                 if f["chat_id"] == chat_id and f["message_id"] == msg_id:
                     title, year = parse_title_year(f["file_name"])
-                    return JSONResponse({"meta": {
+                    poster, imdb_id = await get_poster_and_imdb(f["file_name"])
+                    meta_obj = {
                         "id": item_id, "type": "movie",
                         "name": title or f["file_name"], "year": year,
-                        "poster": "https://via.placeholder.com/300x450?text=No+Poster",
-                    }})
+                        "poster": poster,
+                    }
+                    if imdb_id:
+                        meta_obj["imdbId"] = imdb_id
+                    return JSONResponse({"meta": meta_obj})
             return JSONResponse({"meta": None})
 
         if item_id.startswith(SERIES_PREFIX):
@@ -192,6 +271,7 @@ def add_routes(app: FastAPI):
             g = _series_groups(files).get(sid)
             if not g:
                 return JSONResponse({"meta": None})
+            poster, imdb_id = await get_poster_and_imdb(g["files"][0]["file_name"])
             videos = []
             for f in g["files"]:
                 se = parse_series(f["file_name"])
@@ -199,11 +279,13 @@ def add_routes(app: FastAPI):
                 e = se["episode"] if se else 1
                 videos.append({"id": f"{item_id}:{s}:{e}", "season": s, "episode": e,
                                "title": f["file_name"]})
-            return JSONResponse({"meta": {
+            meta_obj = {
                 "id": item_id, "type": "series", "name": g["title"],
-                "poster": "https://via.placeholder.com/300x450?text=No+Poster",
-                "videos": videos,
-            }})
+                "poster": poster, "videos": videos,
+            }
+            if imdb_id:
+                meta_obj["imdbId"] = imdb_id
+            return JSONResponse({"meta": meta_obj})
 
         return JSONResponse({"meta": None})
 
@@ -226,10 +308,10 @@ def add_routes(app: FastAPI):
             return JSONResponse({"streams": streams})
 
         if item_id.startswith(SERIES_PREFIX):
-            sid, season, episode = item_id[len(SERIES_PREFIX):], None, None
             parts = item_id[len(SERIES_PREFIX):].split(":")
-            if len(parts) >= 3:
-                sid, season, episode = parts[0], int(parts[1]), int(parts[2])
+            sid = parts[0]
+            season = int(parts[1]) if len(parts) >= 3 else None
+            episode = int(parts[2]) if len(parts) >= 3 else None
             g = _series_groups(files).get(sid)
             if g:
                 for f in g["files"]:
@@ -246,6 +328,60 @@ def add_routes(app: FastAPI):
             return JSONResponse({"streams": streams})
 
         return JSONResponse({"streams": []})
+
+    @app.get("/subtitles/{type}/{item_id}.json")
+    async def subtitles(type: str, item_id: str):
+        prefix = MOVIE_PREFIX if type == "movie" else SERIES_PREFIX
+        if not item_id.startswith(prefix):
+            return JSONResponse({"subtitles": []})
+
+        files = _downloaded_files()
+        filename = ""
+        season, episode = None, None
+
+        if type == "movie":
+            parts = item_id[len(MOVIE_PREFIX):].split(":")
+            try:
+                chat_id, msg_id = int(parts[0]), int(parts[1])
+                for f in files:
+                    if f["chat_id"] == chat_id and f["message_id"] == msg_id:
+                        filename = f["file_name"]
+                        break
+            except (ValueError, IndexError):
+                pass
+        else:
+            # tgds:show_id:season:episode
+            parts = item_id[len(SERIES_PREFIX):].split(":")
+            if len(parts) >= 3:
+                sid = parts[0]
+                try:
+                    season, episode = int(parts[1]), int(parts[2])
+                except ValueError:
+                    pass
+                for f in files:
+                    if show_id(f["file_name"]) == sid:
+                        se = parse_series(f["file_name"])
+                        if se and se["season"] == season and se["episode"] == episode:
+                            filename = f["file_name"]
+                            break
+
+        if not filename:
+            return JSONResponse({"subtitles": []})
+
+        _, imdb_id = await get_poster_and_imdb(filename)
+        if not imdb_id:
+            return JSONResponse({"subtitles": []})
+
+        os_id = imdb_id if type == "movie" else f"{imdb_id}:{season}:{episode}"
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
+                if r.status_code == 200:
+                    return JSONResponse(r.json())
+        except Exception as e:
+            print(f"[subtitles] opensubtitles failed for {imdb_id}: {e}")
+
+        return JSONResponse({"subtitles": []})
 
     @app.api_route("/tgfile/{chat_id}/{message_id}", methods=["GET", "HEAD"])
     @app.api_route("/tgfile/{chat_id}/{message_id}/{file_name}", methods=["GET", "HEAD"])
@@ -270,7 +406,6 @@ def add_routes(app: FastAPI):
             if m:
                 start_s, end_s = m.group(1), m.group(2)
                 if start_s == "" and end_s != "":
-                    # suffix range: last N bytes
                     length = min(int(end_s), size)
                     start = size - length
                     end = size - 1
