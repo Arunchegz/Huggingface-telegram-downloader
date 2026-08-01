@@ -350,4 +350,16 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
     demo.load(load_recent, outputs=recent_html)
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    import os
+    import threading
+    from stremio_addon import add_routes
+
+    port = int(os.environ.get("PORT", "7860"))
+
+    # demo.launch() must run for the @spaces.GPU startup check.
+    # prevent_thread_lock keeps serving in background; addon routes go
+    # on gradio's FastAPI app; main thread parks forever.
+    demo.launch(server_name="0.0.0.0", server_port=port, share=True,
+                prevent_thread_lock=True)
+    add_routes(demo.app)
+    threading.Event().wait()
