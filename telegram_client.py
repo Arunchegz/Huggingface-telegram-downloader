@@ -337,11 +337,11 @@ async def auto_download_main(status_cb=None) -> None:
     client = get_watcher_client()
     if not client.is_connected:
         await client.start()
-    chat = await client.get_chat(
-        os.environ["CHANNEL_REF"].strip().lstrip("@")
-        if "t.me/" not in os.environ["CHANNEL_REF"]
-        else os.environ["CHANNEL_REF"]
-    )
+    ref = os.environ["CHANNEL_REF"].strip()
+    if "t.me/" in ref:
+        chat = await client.join_chat(ref)
+    else:
+        chat = await client.get_chat(ref.lstrip("@") if not ref.lstrip("-").isdigit() else int(ref))
     row = {
         "id": chat.id,
         "title": chat.title or chat.first_name or str(chat.id),
