@@ -10,6 +10,7 @@ Endpoints:
 import mimetypes
 import os
 import re
+import urllib.parse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -129,6 +130,11 @@ def _base_url(request: Request) -> str:
     return url
 
 
+def _file_url(base: str, f: dict) -> str:
+    fname = urllib.parse.quote(f["file_name"])
+    return f"{base}/tgfile/{f['chat_id']}/{f['message_id']}/{fname}"
+
+
 # ── addon routes ──────────────────────────────────────────────────────────────
 
 def add_routes(app: FastAPI):
@@ -212,7 +218,7 @@ def add_routes(app: FastAPI):
                     streams.append({
                         "name": "TG Manager",
                         "title": f["file_name"],
-                        "url": f"{base}/tgfile/{chat_id}/{msg_id}",
+                        "url": _file_url(base, f),
                     })
             return JSONResponse({"streams": streams})
 
@@ -232,14 +238,16 @@ def add_routes(app: FastAPI):
                     streams.append({
                         "name": "TG Manager",
                         "title": f["file_name"],
-                        "url": f"{base}/tgfile/{f['chat_id']}/{f['message_id']}",
+                        "url": _file_url(base, f),
                     })
             return JSONResponse({"streams": streams})
 
         return JSONResponse({"streams": []})
 
-    @app.get("/tgfile/{chat_id}/{message_id}")
-    async def serve_file(chat_id: int, message_id: int, request: Request):
+    @app.api_route("/tgfile/{chat_id}/{message_id}", methods=["GET", "HEAD"])
+    @app.api_route("/tgfile/{chat_id}/{message_id}/{file_name}", methods=["GET", "HEAD"])
+    async def serve_file(chat_id: int, message_id: int, request: Request,
+                         file_name: str = None):
         path = resolve_local_path(chat_id, message_id)
         if path is None:
             return Response(status_code=404, content="Not found")
@@ -247,27 +255,45 @@ def add_routes(app: FastAPI):
         size = path.stat().st_size
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         range_header = request.headers.get("range")
+        status = 200
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(size),
+            "Content-Type": media_type,
+        }
 
         if range_header:
             m = re.match(r"bytes=(\d*)-(\d*)", range_header)
             if m:
-                start = int(m.group(1)) if m.group(1) else 0
-                end = int(m.group(2)) if m.group(2) else size - 1
-                end = min(end, size - 1)
-                length = end - start + 1
-                headers = {
-                    "Content-Range": f"bytes {start}-{end}/{size}",
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": str(length),
-                    "Content-Type": media_type,
-                }
+                start_s, end_s = m.group(1), m.group(2)
+                if start_s == "" and end_s != "":
+                    # suffix range: last N bytes
+                    length = min(int(end_s), size)
+                    start = size - length
+                    end = size - 1
+                else:
+                    start = int(start_s) if start_s else 0
+                    end = int(end_s) if end_s else size - 1
+                    end = min(end, size - 1)
+                if start >= size or end < start:
+                    return Response(
+                        status_code=416,
+                        headers={"Content-Range": f"bytes */{size}"},
+                        content="Range Not Satisfiable",
+                    )
+                status = 206
+                headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+                headers["Content-Length"] = str(end - start + 1)
+                if request.method == "HEAD":
+                    return Response(status_code=status, headers=headers)
                 return StreamingResponse(
                     iter_file_chunks(path, start=start, end=end),
-                    status_code=206, headers=headers,
+                    status_code=status, headers=headers,
                 )
 
+        if request.method == "HEAD":
+            return Response(status_code=200, headers=headers)
         return StreamingResponse(
             iter_file_chunks(path),
-            headers={"Accept-Ranges": "bytes", "Content-Length": str(size),
-                     "Content-Type": media_type},
+            status_code=200, headers=headers,
         )
