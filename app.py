@@ -59,50 +59,89 @@ start_auto_downloader()
 
 # ── HTML table helpers ────────────────────────────────────────────────────────
 
-def rows_to_html(rows, selected_chat_id=None, selected_msg_id=None):
-    """Render file list as HTML table with click-to-select via JS."""
+def rows_to_html(rows, selected_chat_id=None, selected_msg_id=None, base_url=""):
+    """Render file list as file-manager style table with copy-link and open buttons."""
     if not rows:
         return "<p style='color:#888'>No files found.</p>"
 
+    TYPE_ICON = {
+        "video": "🎬", "audio": "🎵", "document": "📄",
+        "image": "🖼️", "archive": "🗜️",
+    }
+
+    from config import STORAGE_BUCKET_BASE as _BUCKET
+
     html = """
     <style>
-    .tg-table { width:100%; border-collapse:collapse; font-size:13px; }
-    .tg-table th { background:#2d2d2d; color:#fff; padding:6px 8px; text-align:left; }
-    .tg-table td { padding:5px 8px; border-bottom:1px solid #333; }
-    .tg-table tr:hover { background:#1a1a2e; cursor:pointer; }
-    .tg-table tr.selected { background:#0f3460; }
-    .cached-yes { color:#4caf50; font-weight:bold; }
-    .cached-no  { color:#888; }
+    .fm-wrap{font-family:monospace;font-size:13px;}
+    .fm-table{width:100%;border-collapse:collapse;}
+    .fm-table th{background:#1e1e2e;color:#cdd6f4;padding:7px 10px;text-align:left;font-weight:600;border-bottom:2px solid #45475a;}
+    .fm-table td{padding:6px 10px;border-bottom:1px solid #313244;vertical-align:middle;}
+    .fm-table tr:hover td{background:#181825;}
+    .fm-table tr.fm-sel td{background:#1e3a5f;}
+    .fm-name{color:#cdd6f4;cursor:pointer;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block;}
+    .fm-name:hover{color:#89b4fa;}
+    .fm-size{color:#a6e3a1;white-space:nowrap;}
+    .fm-date{color:#9399b2;white-space:nowrap;font-size:11px;}
+    .fm-type{color:#cba6f7;text-align:center;font-size:16px;}
+    .fm-cached-y{color:#a6e3a1;text-align:center;font-size:15px;}
+    .fm-cached-n{color:#45475a;text-align:center;font-size:15px;}
+    .fm-actions{white-space:nowrap;}
+    .fm-btn{display:inline-block;padding:3px 10px;border-radius:4px;border:none;cursor:pointer;font-size:11px;font-weight:600;margin-right:4px;}
+    .fm-open{background:#313244;color:#cdd6f4;}
+    .fm-open:hover{background:#45475a;}
+    .fm-copy{background:#1e3a5f;color:#89b4fa;}
+    .fm-copy:hover{background:#2a4a7f;}
+    .fm-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#a6e3a1;color:#1e1e2e;padding:7px 20px;border-radius:6px;font-size:13px;font-weight:700;z-index:9999;display:none;pointer-events:none;}
     </style>
-    <table class='tg-table'>
+    <div class='fm-wrap'>
+    <div id='fm-toast' class='fm-toast'>🔗 Link copied!</div>
+    <table class='fm-table'>
     <thead><tr>
-      <th>File Name</th><th>Type</th><th>Size</th><th>Date</th><th>Cached</th>
-      <th style='display:none'>chat_id</th><th style='display:none'>msg_id</th>
+      <th>Name</th><th>Type</th><th>Size</th><th>Date</th><th>●</th><th>Actions</th>
     </tr></thead><tbody>
     """
+
     for r in rows:
         r = enrich_file_row(r)
-        cached_cls = "cached-yes" if r["cached"] else "cached-no"
-        cached_sym = "✅" if r["cached"] else "⬜"
         chat_id = r["chat_id"]
         msg_id  = r["message_id"]
-        sel_cls = "selected" if (str(chat_id) == str(selected_chat_id) and
-                                  str(msg_id)  == str(selected_msg_id)) else ""
+        fname   = r["file_name"].replace("'", "").replace('"', "")
+        icon    = TYPE_ICON.get(r["media_type"], "📁")
+        cached  = r["cached"]
+        sel_cls = "fm-sel" if (str(chat_id) == str(selected_chat_id) and
+                               str(msg_id)  == str(selected_msg_id)) else ""
+
+        if _BUCKET:
+            dl_url = f"{_BUCKET.rstrip('/')}/{chat_id}/{fname}"
+        else:
+            dl_url = f"{base_url}/tgfile/{chat_id}/{msg_id}/{fname}" if base_url else f"/tgfile/{chat_id}/{msg_id}/{fname}"
+
+        dl_url_js = dl_url.replace("'", "\\'")
+        display_name = r["file_name"][:70] + ("…" if len(r["file_name"]) > 70 else "")
+
         html += f"""
-        <tr class='{sel_cls}' onclick="
-            document.getElementById('hidden_chat').value='{chat_id}';
-            document.getElementById('hidden_msg').value='{msg_id}';
-            document.getElementById('hidden_fname').value='{r['file_name'].replace(chr(39),'')}';
-            document.querySelectorAll('.tg-table tr').forEach(t=>t.classList.remove('selected'));
-            this.classList.add('selected');
-        ">
-          <td title='{r["file_name"]}'>{r["file_name"][:60]}{"…" if len(r["file_name"])>60 else ""}</td>
-          <td>{r["media_type"]}</td>
-          <td>{r["size_fmt"]}</td>
-          <td>{r["date_fmt"]}</td>
-          <td class='{cached_cls}'>{cached_sym}</td>
+        <tr class='{sel_cls}' id='fm-{chat_id}-{msg_id}'>
+          <td>
+            <span class='fm-name' title='{r["file_name"]}' onclick="
+              document.querySelectorAll('.fm-table tr').forEach(t=>t.classList.remove('fm-sel'));
+              document.getElementById('fm-{chat_id}-{msg_id}').classList.add('fm-sel');
+              document.getElementById('hidden_chat').value='{chat_id}';
+              document.getElementById('hidden_msg').value='{msg_id}';
+              document.getElementById('hidden_fname').value='{fname}';
+            ">{icon} {display_name}</span>
+          </td>
+          <td class='fm-type'>{r["media_type"]}</td>
+          <td class='fm-size'>{r["size_fmt"]}</td>
+          <td class='fm-date'>{r["date_fmt"]}</td>
+          <td class='{"fm-cached-y" if cached else "fm-cached-n"}'>{"●" if cached else "○"}</td>
+          <td class='fm-actions'>
+            <button class='fm-btn fm-open' onclick="window.open('{dl_url_js}','_blank')">⬇ Open</button>
+            <button class='fm-btn fm-copy' onclick="navigator.clipboard.writeText('{dl_url_js}').then(()=>{{var t=document.getElementById('fm-toast');t.style.display='block';setTimeout(()=>t.style.display='none',1800)}})">🔗 Copy</button>
+          </td>
         </tr>"""
-    html += "</tbody></table>"
+
+    html += "</tbody></table></div>"
     return html
 
 
@@ -165,14 +204,17 @@ def chats_to_choices():
 
 # ── browse ────────────────────────────────────────────────────────────────────
 
-def browse_chat(chat_id_str, media_type_filter):
+def browse_chat(chat_id_str, media_type_filter, request: gr.Request = None):
     if not chat_id_str:
         return "<p>Select a chat first.</p>", "—"
     try:
         rows = search_files(chat_id=int(chat_id_str), media_type=media_type_filter, limit=200)
         counts = get_type_counts(int(chat_id_str))
         summary = " | ".join(f"{k}: {v}" for k, v in counts.items() if v > 0)
-        return rows_to_html(rows), summary
+        base = ""
+        if request:
+            base = f"{request.request.url.scheme}://{request.request.url.netloc}"
+        return rows_to_html(rows, base_url=base), summary
     except Exception as e:
         return f"<p>❌ {e}</p>", "—"
 
@@ -282,23 +324,16 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
                 type_dd = gr.Dropdown(["all","video","audio","document","image","archive"],
                                       value="all", label="Type", scale=1)
             with gr.Row():
-                btn_browse = gr.Button("Browse", variant="primary")
+                btn_browse = gr.Button("📂 Browse", variant="primary")
                 scan_limit = gr.Slider(50, 1000, value=200, step=50, label="Scan limit")
                 btn_scan   = gr.Button("🔍 Scan")
                 btn_fav    = gr.Button("⭐ Fav")
-            browse_status = gr.Textbox(label="", interactive=False)
+            browse_status = gr.Textbox(label="", interactive=False, show_label=False)
             browse_html   = gr.HTML()
-            gr.Markdown("**Selected file** — paste Chat ID + Msg ID from table row, then download:")
-            with gr.Row():
-                sel_chat = gr.Textbox(label="Chat ID")
-                sel_msg  = gr.Textbox(label="Msg ID")
-            btn_dl_b    = gr.Button("⬇ Download", variant="primary")
-            dl_status_b = gr.Textbox(label="Status", interactive=False)
 
             btn_browse.click(browse_chat, [browse_chat_dd, type_dd], [browse_html, browse_status])
             btn_scan.click(scan_chat_action, [browse_chat_dd, scan_limit], browse_status)
             btn_fav.click(toggle_fav_action, browse_chat_dd, [browse_status, browse_chat_dd])
-            btn_dl_b.click(start_download_action, [sel_chat, sel_msg], dl_status_b)
 
         # ── Search ────────────────────────────────────────────────────────────
         with gr.TabItem("🔍 Search"):
