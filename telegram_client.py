@@ -10,7 +10,7 @@ from pyrogram.errors import FloodWait, FileReferenceExpired
 
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
-                    POLL_INTERVAL, MAX_CACHE_BYTES)
+                    POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS)
 from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg
 from storage import get_cache_size
 
@@ -42,6 +42,51 @@ def get_watcher_client() -> Client:
             in_memory=True,
         )
     return _watcher_client
+
+
+_extra_clients: list[Client] = []
+
+
+def _is_bot_token(tok: str) -> bool:
+    return bool(re.match(r"^\d+:[A-Za-z0-9_-]{20,}$", tok))
+
+
+def get_download_clients() -> list[Client]:
+    """Pool of clients used for downloads: watcher session + extra sessions."""
+    global _extra_clients
+    if not _extra_clients:
+        for i, tok in enumerate(EXTRA_TOKENS):
+            if _is_bot_token(tok):
+                _extra_clients.append(Client(
+                    name=f"tgfiles_bot_{i}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    bot_token=tok,
+                    in_memory=True,
+                ))
+            else:
+                _extra_clients.append(Client(
+                    name=f"tgfiles_extra_{i}",
+                    api_id=API_ID,
+                    api_hash=API_HASH,
+                    session_string=tok,
+                    in_memory=True,
+                ))
+    return [get_watcher_client()] + _extra_clients
+
+
+async def start_download_clients(ref: str, chat_id: int) -> None:
+    """Connect every download client and warm its peer storage."""
+    for c in get_download_clients():
+        try:
+            if not c.is_connected:
+                await c.start()
+            try:
+                await c.get_chat(ref)
+            except Exception:
+                pass
+        except Exception:
+            continue
 
 
 async def ensure_started():
@@ -269,6 +314,8 @@ async def download_channel_all(
         await client.start()
     count = 0
     last_id = get_last_msg_id(chat_id)
+    dl_clients = get_download_clients()
+    dl_idx = 0
 
     async for msg in client.get_chat_history(chat_id, limit=limit):
         meta = _extract_file_meta(msg)
@@ -284,7 +331,9 @@ async def download_channel_all(
         if status_cb:
             status_cb(f"⬇ [{msg.id}] {meta['file_name']} ({meta['file_size']//1024//1024} MB)")
         try:
-            path = await download_file(chat_id, msg.id, meta["file_name"], client=client)
+            dl_client = dl_clients[dl_idx % len(dl_clients)]
+            dl_idx += 1
+            path = await download_file(chat_id, msg.id, meta["file_name"], client=dl_client)
             if path:
                 count += 1
         except Exception as e:
@@ -314,6 +363,8 @@ async def watch_channel_new(
     while True:
         try:
             newest_id = last_id
+            dl_clients = get_download_clients()
+            dl_idx = 0
             async for msg in client.get_chat_history(chat_id, limit=50):
                 meta = _extract_file_meta(msg)
                 if not meta:
@@ -326,7 +377,9 @@ async def watch_channel_new(
                         status_cb(f"Cache limit reached, skipping {meta['file_name']}")
                     continue
                 try:
-                    path = await download_file(chat_id, msg.id, meta["file_name"], client=client)
+                    dl_client = dl_clients[dl_idx % len(dl_clients)]
+                    dl_idx += 1
+                    path = await download_file(chat_id, msg.id, meta["file_name"], client=dl_client)
                     if path and status_cb:
                         status_cb(f"⬇ NEW [{msg.id}] {meta['file_name']}")
                 except Exception as e:
@@ -423,6 +476,12 @@ async def auto_download_main(status_cb=None) -> None:
     def _status(s):
         if status_cb:
             status_cb(s)
+
+    extras = get_download_clients()[1:]
+    if extras:
+        if status_cb:
+            status_cb(f"🔌 Extra download sessions: {len(extras)}")
+        await start_download_clients(ref, row["id"])
 
     count = await download_channel_all(row["id"], status_cb=_status, client=client)
     if status_cb:

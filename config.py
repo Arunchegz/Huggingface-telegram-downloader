@@ -20,6 +20,12 @@ AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
 INITIAL_SCAN_LIMIT = int(os.environ.get("INITIAL_SCAN_LIMIT", "500"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 
+# Extra download sessions (comma-separated): bot tokens or session strings.
+# Each session has its own rate limits -> spreads GetFile flood waits.
+EXTRA_TOKENS = [
+    t.strip() for t in os.environ.get("EXTRA_TOKENS", "").split(",") if t.strip()
+]
+
 # Limits
 MAX_CACHE_GB = float(os.environ.get("MAX_CACHE_GB", "10"))
 MAX_CACHE_BYTES = MAX_CACHE_GB * 1024 ** 3
