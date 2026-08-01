@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import gradio as gr
 import spaces
 from pathlib import Path
@@ -6,8 +7,9 @@ from pathlib import Path
 from database import init_db
 from search import search_files, get_type_counts, get_chat_file_stats, enrich_file_row, fmt_size
 from storage import get_storage_stats, clear_all_cache
-from telegram_client import fetch_chats, scan_chat, download_file, get_me, resolve_chat
+from telegram_client import fetch_chats, scan_chat, download_file, get_me, resolve_chat, auto_download_main
 from database import get_chats, toggle_favorite, recent_downloads, get_file_by_msg
+from config import AUTO_DOWNLOAD, CHANNEL_REF
 
 init_db()
 
@@ -25,6 +27,26 @@ def run_async(coro):
         return loop.run_until_complete(coro)
     except RuntimeError:
         return asyncio.run(coro)
+
+# ── auto-downloader (background) ──────────────────────────────────────────────
+
+def start_auto_downloader():
+    if not AUTO_DOWNLOAD or not CHANNEL_REF:
+        return
+
+    def _status(msg):
+        print(f"[auto] {msg}")
+
+    def _run():
+        try:
+            asyncio.run(auto_download_main(status_cb=_status))
+        except Exception as e:
+            print(f"[auto] FATAL: {e}")
+
+    t = threading.Thread(target=_run, daemon=True, name="auto-downloader")
+    t.start()
+
+start_auto_downloader()
 
 # ── HTML table helpers ────────────────────────────────────────────────────────
 

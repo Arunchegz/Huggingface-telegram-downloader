@@ -10,7 +10,15 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 BASE_DIR = Path(os.environ.get("PERSISTENT_STORAGE", "/data"))
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DB_PATH = BASE_DIR / "database.db"
+STATE_DIR = BASE_DIR / "state"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Auto-downloader
+CHANNEL_REF = os.environ.get("CHANNEL_REF", "").strip()
+AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
+INITIAL_SCAN_LIMIT = int(os.environ.get("INITIAL_SCAN_LIMIT", "500"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
 
 # Limits
 MAX_CACHE_GB = float(os.environ.get("MAX_CACHE_GB", "10"))

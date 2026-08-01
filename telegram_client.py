@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from pathlib import Path
 from datetime import datetime
@@ -6,10 +7,14 @@ from pyrogram import Client
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, FileReferenceExpired
 
-from config import API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE, ALL_EXTENSIONS, MEDIA_TYPES
+from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
+                    ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
+                    POLL_INTERVAL, MAX_CACHE_BYTES)
 from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download
+from storage import get_cache_size
 
 _client: Client | None = None
+_watcher_client: Client | None = None
 
 
 def get_client() -> Client:
@@ -23,6 +28,19 @@ def get_client() -> Client:
             in_memory=True,
         )
     return _client
+
+
+def get_watcher_client() -> Client:
+    global _watcher_client
+    if _watcher_client is None:
+        _watcher_client = Client(
+            name="tgfiles_watcher",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING,
+            in_memory=True,
+        )
+    return _watcher_client
 
 
 async def ensure_started():
@@ -196,6 +214,153 @@ async def resolve_chat(ref: str) -> dict:
     }
     upsert_chat(row)
     return row
+
+
+# ── auto-downloader ───────────────────────────────────────────────────────────
+
+def _state_file(chat_id: int) -> Path:
+    return STATE_DIR / f"last_msg_{chat_id}.json"
+
+
+def get_last_msg_id(chat_id: int) -> int:
+    try:
+        return json.loads(_state_file(chat_id).read_text()).get("last_msg_id", 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _save_last_msg_id(chat_id: int, msg_id: int):
+    try:
+        _state_file(chat_id).write_text(json.dumps({"last_msg_id": msg_id}))
+    except OSError:
+        pass
+
+
+def _cache_full(needed: int) -> bool:
+    return get_cache_size() + needed > MAX_CACHE_BYTES
+
+
+async def download_channel_all(
+    chat_id: int,
+    limit: int = INITIAL_SCAN_LIMIT,
+    status_cb=None,
+    client: Client | None = None,
+) -> int:
+    """Download every media file in the channel, skipping already-cached ones."""
+    client = client or get_client()
+    if not client.is_connected:
+        await client.start()
+    count = 0
+    last_id = get_last_msg_id(chat_id)
+
+    async for msg in client.get_chat_history(chat_id, limit=limit):
+        meta = _extract_file_meta(msg)
+        if not meta:
+            continue
+        upsert_file(meta)
+        if msg.id <= last_id:
+            continue
+        if _cache_full(meta["file_size"]):
+            if status_cb:
+                status_cb(f"Cache limit reached, stopping at {meta['file_name']}")
+            break
+        if status_cb:
+            status_cb(f"⬇ [{msg.id}] {meta['file_name']} ({meta['file_size']//1024//1024} MB)")
+        try:
+            path = await download_file(chat_id, msg.id, meta["file_name"])
+            if path:
+                count += 1
+        except Exception as e:
+            if status_cb:
+                status_cb(f"⚠ [{msg.id}] {meta['file_name']}: {e}")
+        last_id = max(last_id, msg.id)
+        await asyncio.sleep(0)
+
+    _save_last_msg_id(chat_id, last_id)
+    return count
+
+
+async def watch_channel_new(
+    chat_id: int,
+    interval: int = POLL_INTERVAL,
+    status_cb=None,
+    client: Client | None = None,
+):
+    """Poll the channel and download newly added media files."""
+    client = client or get_client()
+    if not client.is_connected:
+        await client.start()
+    last_id = get_last_msg_id(chat_id)
+    if status_cb:
+        status_cb(f"👀 Watching channel (last msg {last_id}, poll {interval}s)")
+
+    while True:
+        try:
+            newest_id = last_id
+            async for msg in client.get_chat_history(chat_id, limit=50):
+                meta = _extract_file_meta(msg)
+                if not meta:
+                    continue
+                upsert_file(meta)
+                if msg.id <= last_id:
+                    break
+                if _cache_full(meta["file_size"]):
+                    if status_cb:
+                        status_cb(f"Cache limit reached, skipping {meta['file_name']}")
+                    continue
+                try:
+                    path = await download_file(chat_id, msg.id, meta["file_name"])
+                    if path and status_cb:
+                        status_cb(f"⬇ NEW [{msg.id}] {meta['file_name']}")
+                except Exception as e:
+                    if status_cb:
+                        status_cb(f"⚠ NEW [{msg.id}] {meta['file_name']}: {e}")
+                newest_id = max(newest_id, msg.id)
+                await asyncio.sleep(0)
+            if newest_id > last_id:
+                last_id = newest_id
+                _save_last_msg_id(chat_id, last_id)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            if status_cb:
+                status_cb(f"⚠ watch error: {e}")
+        await asyncio.sleep(interval)
+
+
+async def auto_download_main(status_cb=None) -> None:
+    """Resolve CHANNEL_REF, download existing files, then watch for new ones."""
+    if not os.environ.get("CHANNEL_REF"):
+        if status_cb:
+            status_cb("CHANNEL_REF not set; auto-downloader disabled.")
+        return
+    client = get_watcher_client()
+    if not client.is_connected:
+        await client.start()
+    chat = await client.get_chat(
+        os.environ["CHANNEL_REF"].strip().lstrip("@")
+        if "t.me/" not in os.environ["CHANNEL_REF"]
+        else os.environ["CHANNEL_REF"]
+    )
+    row = {
+        "id": chat.id,
+        "title": chat.title or chat.first_name or str(chat.id),
+        "type": str(chat.type),
+        "username": chat.username or "",
+        "last_synced": datetime.utcnow().isoformat(),
+    }
+    upsert_chat(row)
+    if status_cb:
+        status_cb(f"📡 Channel: {row['title']} (ID {row['id']})")
+
+    async def _status(s):
+        if status_cb:
+            status_cb(s)
+
+    count = await download_channel_all(row["id"], status_cb=_status, client=client)
+    if status_cb:
+        status_cb(f"✅ Initial download done: {count} files.")
+    await watch_channel_new(row["id"], status_cb=_status, client=client)
 
 
 async def get_me() -> dict:
