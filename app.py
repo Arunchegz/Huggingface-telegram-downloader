@@ -316,21 +316,22 @@ with gr.Blocks(title="TGFiles", theme=gr.themes.Soft()) as demo:
     status_bar = gr.Textbox(label="", interactive=False, show_label=False, max_lines=1)
     file_html  = gr.HTML()
 
-    def do_browse(chat_id_str, media_type, request: gr.Request = None):
+    def do_browse(chat_id_str, media_type):
         if not chat_id_str:
             return "", "<p style='color:#888'>Select a chat to browse.</p>"
         try:
             rows = search_files(chat_id=int(chat_id_str), media_type=media_type, limit=500)
             counts = get_type_counts(int(chat_id_str))
             summary = "  ".join(f"{k} {v}" for k, v in counts.items() if v > 0)
-            base = ""
-            if request:
-                base = f"{request.request.url.scheme}://{request.request.url.netloc}"
+            import os
+            base = os.environ.get("SPACE_HOST", "")
+            if base and not base.startswith("http"):
+                base = f"https://{base}"
             return f"{len(rows)} files  |  {summary}", rows_to_html(rows, base_url=base)
         except Exception as e:
             return f"❌ {e}", ""
 
-    def do_sync(request: gr.Request = None):
+    def do_sync():
         try:
             chats = run_async(fetch_chats())
             return f"✅ Synced {len(chats)} chats.", gr.update(choices=chats_to_choices())
