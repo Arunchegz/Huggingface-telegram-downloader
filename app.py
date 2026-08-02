@@ -50,7 +50,8 @@ if __name__ == "__main__":
 
     # demo.launch() must run for the @spaces.GPU startup check;
     # addon routes go on gradio's FastAPI app, main thread parks forever.
-    demo = gr.Blocks(title="TG Manager Stremio Addon")
+    with gr.Blocks(title="TG Manager Stremio Addon") as demo:
+        pass
     demo.launch(server_name="0.0.0.0", server_port=port, share=True,
                 prevent_thread_lock=True)
     add_routes(demo.app)
