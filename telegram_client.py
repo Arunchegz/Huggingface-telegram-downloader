@@ -8,7 +8,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, FileReferenceExpired
 from pyrogram.raw.types import UpdateDeleteChannelMessages, UpdateDeleteMessages
-from pyrogram.handlers import RawUpdateHandler
+from pyrogram.handlers import RawUpdateHandler, MessageHandler
 
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     ALL_EXTENSIONS, MEDIA_TYPES, STATE_DIR, INITIAL_SCAN_LIMIT,
@@ -20,6 +20,8 @@ from storage import get_cache_size
 
 _client: Client | None = None
 _watcher_client: Client | None = None
+_watching_chat_id: int | None = None
+_in_flight: set[tuple[int, int]] = set()
 
 
 def get_client() -> Client:
@@ -411,30 +413,9 @@ async def watch_channel_new(
                 _save_last_msg_id(chat_id, last_id)
 
             if pending:
-                sem = asyncio.Semaphore(min(MAX_CONCURRENT_DOWNLOADS, len(dl_clients)))
-                counter = {"n": 0}
-                lock = asyncio.Lock()
-
-                async def _one(meta: dict):
-                    async with sem:
-                        try:
-                            async with lock:
-                                idx = counter["n"] % len(dl_clients)
-                                counter["n"] += 1
-                            dl_client = dl_clients[idx]
-                            if status_cb:
-                                status_cb(f"⬇ NEW [{meta['message_id']}] {meta['file_name']} "
-                                          f"@ {dl_client.name}")
-                            path = await download_file(
-                                chat_id, meta["message_id"], meta["file_name"],
-                                client=dl_client)
-                            if path and status_cb:
-                                status_cb(f"✅ NEW [{meta['message_id']}] {meta['file_name']}")
-                        except Exception as e:
-                            if status_cb:
-                                status_cb(f"⚠ NEW [{meta['message_id']}] {meta['file_name']}: {e}")
-
-                await asyncio.gather(*[_one(m) for m in pending])
+                for meta in pending:
+                    await _download_new_meta(chat_id, meta, status_cb=status_cb,
+                                             clients=dl_clients)
         except FloodWait as e:
             await asyncio.sleep(e.value)
         except Exception as e:
@@ -475,6 +456,50 @@ async def _chat_from_invite(client: Client, ref: str):
     if getattr(res, "channel", False) or getattr(res, "broadcast", False):
         return -1000000000000 - cid
     return -cid
+
+
+async def _download_new_meta(chat_id: int, meta: dict, status_cb=None,
+                             clients: list | None = None) -> None:
+    """Download one newly posted file with in-flight dedupe (instant + poll share this)."""
+    key = (chat_id, meta["message_id"])
+    if key in _in_flight:
+        return
+    _in_flight.add(key)
+    try:
+        if _cache_full(meta["file_size"]):
+            if status_cb:
+                status_cb(f"Cache limit reached, skipping {meta['file_name']}")
+            return
+        clients = clients or get_download_clients()
+        idx = len(_in_flight) % len(clients)
+        dl_client = clients[idx]
+        if status_cb:
+            status_cb(f"⬇ NEW [{meta['message_id']}] {meta['file_name']} @ {dl_client.name}")
+        path = await download_file(chat_id, meta["message_id"], meta["file_name"],
+                                   client=dl_client)
+        if path and status_cb:
+            status_cb(f"✅ NEW [{meta['message_id']}] {meta['file_name']}")
+    except Exception as e:
+        if status_cb:
+            status_cb(f"⚠ NEW [{meta['message_id']}] {meta['file_name']}: {e}")
+    finally:
+        _in_flight.discard(key)
+
+
+async def _on_new_channel_message(client: Client, message: Message, status_cb=None):
+    """Instant delivery: Pyrogram pushes channel posts over MTProto (no polling wait)."""
+    chat = message.chat
+    if chat is None or chat.id != _watching_chat_id:
+        return
+    meta = _extract_file_meta(message)
+    if not meta:
+        return
+    upsert_file(meta)
+    last_id = get_last_msg_id(chat.id)
+    if message.id <= last_id:
+        return
+    _save_last_msg_id(chat.id, message.id)
+    await _download_new_meta(chat.id, meta, status_cb=status_cb)
 
 
 async def _handle_delete_update(client: Client, update, users, chats, status_cb=None):
@@ -585,6 +610,16 @@ async def auto_download_main(status_cb=None) -> None:
     def _status(s):
         if status_cb:
             status_cb(s)
+
+    global _watching_chat_id
+    _watching_chat_id = row["id"]
+
+    async def _msg_handler(c, message):
+        await _on_new_channel_message(c, message, status_cb=_status)
+
+    client.add_handler(MessageHandler(_msg_handler, filters.channel))
+    if status_cb:
+        status_cb("⚡ Instant new-message handler registered (MTProto push)")
 
     extras = get_download_clients()[1:]
     if extras:
