@@ -20,13 +20,65 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from config import DOWNLOAD_DIR, TMDB_API_KEY
+from config import DOWNLOAD_DIR, TMDB_API_KEY, HF_TOKEN, STORAGE_BUCKET_REPO, STORAGE_BUCKET_TYPE
 from database import get_conn
 from storage import iter_file_chunks, resolve_local_path
 
 BASE_URL = os.environ.get("ADDON_BASE_URL", "").rstrip("/")
 STORAGE_BUCKET_BASE = os.environ.get("STORAGE_BUCKET_BASE", "").rstrip("/")
 OPENSUBTITLES_BASE = "https://opensubtitles-v3.strem.io"
+
+# ── HF private bucket CDN URL resolver ───────────────────────────────────────
+# Set STORAGE_BUCKET_REPO=owner/repo-name and HF_TOKEN in env to enable.
+# On each /stream request, resolves the private bucket file to a short-lived
+# CloudFront pre-signed URL (valid ~24h) and returns it directly to Stremio.
+# Stremio streams from HF CDN — no proxying on your server.
+
+HF_BUCKET_COLLECTION = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
+
+
+def _hf_bucket_url(chat_id: int, file_name: str) -> str:
+    """Build the HF bucket resolve URL for a file."""
+    repo = STORAGE_BUCKET_REPO
+    if not repo:
+        return ""
+    repo_type = STORAGE_BUCKET_TYPE or "space"
+    # HF bucket resolve endpoint: /buckets/{owner}/{repo}/resolve/{collection}/{path}
+    # repo_type is only needed for dataset/model buckets; space buckets use /buckets/ directly
+    encoded = urllib.parse.quote(file_name, safe="")
+    return (
+        f"https://huggingface.co/buckets/{repo}/resolve"
+        f"/{HF_BUCKET_COLLECTION}/{chat_id}/{encoded}"
+    )
+
+
+async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
+    """
+    Resolve a private HF bucket file to a CloudFront pre-signed CDN URL.
+    HF returns HTTP 302 → Location header contains the signed CDN URL.
+    Returns empty string on failure (caller falls back to local proxy).
+    """
+    if not STORAGE_BUCKET_REPO or not HF_TOKEN:
+        return ""
+    bucket_url = _hf_bucket_url(chat_id, file_name)
+    if not bucket_url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as c:
+            r = await c.get(
+                bucket_url,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                params={"download": "true"},
+            )
+            if r.status_code in (301, 302, 303, 307, 308):
+                cdn_url = r.headers.get("location", "")
+                if cdn_url:
+                    return cdn_url
+            # Some HF responses return 200 with a redirect body — try anyway
+            print(f"[hf-bucket] unexpected status {r.status_code} for {file_name}")
+    except Exception as e:
+        print(f"[hf-bucket] CDN URL resolve failed for {file_name!r}: {e}")
+    return ""
 
 MOVIE_PREFIX = "tgdm:"
 SERIES_PREFIX = "tgds:"
@@ -464,10 +516,22 @@ def _base_url(request: Request) -> str:
     return url
 
 
-def _file_url(base: str, f: dict) -> str:
-    fname = urllib.parse.quote(f["file_name"])
+async def _file_url(base: str, f: dict) -> str:
+    """
+    Resolve the stream URL for a file:
+    1. If STORAGE_BUCKET_REPO + HF_TOKEN set → resolve private bucket to CDN URL (per-request).
+    2. Elif STORAGE_BUCKET_BASE set → static public bucket URL (legacy).
+    3. Else → local /tgfile proxy.
+    """
+    if STORAGE_BUCKET_REPO and HF_TOKEN:
+        cdn_url = await get_hf_cdn_url(f["chat_id"], f["file_name"])
+        if cdn_url:
+            return cdn_url
+        # Fall through to local proxy if CDN resolution failed
     if STORAGE_BUCKET_BASE:
+        fname = urllib.parse.quote(f["file_name"])
         return f"{STORAGE_BUCKET_BASE}/{f['chat_id']}/{fname}"
+    fname = urllib.parse.quote(f["file_name"])
     return f"{base}/tgfile/{f['chat_id']}/{f['message_id']}/{fname}"
 
 
@@ -607,7 +671,7 @@ def add_routes(app: FastAPI):
                 streams.append({
                     "name": "TG Manager",
                     "title": f"{f['file_name']}{size_str}",
-                    "url": _file_url(base, f),
+                    "url": await _file_url(base, f),
                 })
             return JSONResponse({"streams": streams})
 
@@ -620,7 +684,7 @@ def add_routes(app: FastAPI):
                     streams.append({
                         "name": "TG Manager",
                         "title": f["file_name"],
-                        "url": _file_url(base, f),
+                        "url": await _file_url(base, f),
                     })
             return JSONResponse({"streams": streams})
 
@@ -640,7 +704,7 @@ def add_routes(app: FastAPI):
                     streams.append({
                         "name": "TG Manager",
                         "title": f["file_name"],
-                        "url": _file_url(base, f),
+                        "url": await _file_url(base, f),
                     })
             return JSONResponse({"streams": streams})
 
