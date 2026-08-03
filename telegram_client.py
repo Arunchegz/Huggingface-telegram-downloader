@@ -48,6 +48,8 @@ def get_watcher_client() -> Client:
 
 
 _extra_clients: list[Client] = []
+_bot_clients: list[Client] = []
+_rr_idx = 0
 
 
 def _is_bot_token(tok: str) -> bool:
@@ -62,7 +64,7 @@ def get_download_clients() -> list[Client]:
     duplicate of another token — is skipped, since connecting it alongside the
     main client triggers AuthKeyDuplicated.
     """
-    global _extra_clients
+    global _extra_clients, _bot_clients
     if not _extra_clients:
         seen = {SESSION_STRING}
         for i, tok in enumerate(EXTRA_TOKENS):
@@ -70,22 +72,37 @@ def get_download_clients() -> list[Client]:
                 continue
             seen.add(tok)
             if _is_bot_token(tok):
-                _extra_clients.append(Client(
+                c = Client(
                     name=f"tgfiles_bot_{i}",
                     api_id=API_ID,
                     api_hash=API_HASH,
                     bot_token=tok,
                     in_memory=True,
-                ))
+                )
+                _bot_clients.append(c)
             else:
-                _extra_clients.append(Client(
+                c = Client(
                     name=f"tgfiles_extra_{i}",
                     api_id=API_ID,
                     api_hash=API_HASH,
                     session_string=tok,
                     in_memory=True,
-                ))
+                )
+            _extra_clients.append(c)
     return [get_watcher_client()] + _extra_clients
+
+
+def _pick_dl_client(clients: list[Client]) -> Client:
+    """Round-robin pick for a download, preferring bot sessions.
+
+    Bots have much higher upload.GetFile limits than user accounts, so they
+    should carry downloads whenever available; the user session is only used
+    when no bot/extra sessions exist.
+    """
+    global _rr_idx
+    target = _bot_clients or _extra_clients or clients
+    _rr_idx = (_rr_idx + 1) % len(target)
+    return target[_rr_idx]
 
 
 async def start_download_clients(ref: str, chat_id: int) -> None:
@@ -202,9 +219,9 @@ async def download_file(
     client: Client | None = None,
 ) -> Path | None:
     """Download file to DOWNLOAD_DIR. Returns local path or None on failure."""
-    # Use watcher client (download pool head) by default, not the browse client,
-    # to avoid rate-limit collisions with scan/fetch operations.
-    client = client or get_watcher_client()
+    # Prefer bot sessions for downloads (higher upload.GetFile limits),
+    # not the browse client, to avoid the user session's flood waits.
+    client = client or _pick_dl_client(get_download_clients())
     if not client.is_connected:
         await client.start()
 
@@ -355,18 +372,13 @@ async def download_channel_all(
         status_cb(f"🎯 {len(pending)} files to download (clients: {len(dl_clients)})")
 
     sem = asyncio.Semaphore(min(MAX_CONCURRENT_DOWNLOADS, len(dl_clients)))
-    counter = {"n": 0}
-    lock = asyncio.Lock()
 
     async def _one(meta: dict) -> bool:
         async with sem:
             try:
                 if _cache_full(meta["file_size"]):
                     return False
-                async with lock:
-                    idx = counter["n"] % len(dl_clients)
-                    counter["n"] += 1
-                dl_client = dl_clients[idx]
+                dl_client = _pick_dl_client(dl_clients)
                 if status_cb:
                     status_cb(f"⬇ [{meta['message_id']}] {meta['file_name']} "
                               f"({meta['file_size']//1024//1024} MB) @ {dl_client.name}")
@@ -478,8 +490,7 @@ async def _download_new_meta(chat_id: int, meta: dict, status_cb=None,
                 status_cb(f"Cache limit reached, skipping {meta['file_name']}")
             return
         clients = clients or get_download_clients()
-        idx = len(_in_flight) % len(clients)
-        dl_client = clients[idx]
+        dl_client = _pick_dl_client(clients)
         if status_cb:
             status_cb(f"⬇ NEW [{meta['message_id']}] {meta['file_name']} @ {dl_client.name}")
         path = await download_file(chat_id, meta["message_id"], meta["file_name"],

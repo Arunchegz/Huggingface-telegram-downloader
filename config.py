@@ -14,18 +14,21 @@ STATE_DIR = BASE_DIR / "state"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Auto-downloader
-CHANNEL_REF = os.environ.get("CHANNEL_REF", "").strip()
-AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
-INITIAL_SCAN_LIMIT = int(os.environ.get("INITIAL_SCAN_LIMIT", "500"))
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "1"))
-
 # Extra download sessions (comma-separated): bot tokens or session strings.
 # Each session has its own rate limits -> spreads GetFile flood waits.
 EXTRA_TOKENS = [
     t.strip() for t in os.environ.get("EXTRA_TOKENS", "").split(",") if t.strip()
 ]
+
+# Auto-downloader
+CHANNEL_REF = os.environ.get("CHANNEL_REF", "").strip()
+AUTO_DOWNLOAD = os.environ.get("AUTO_DOWNLOAD", "1") == "1"
+INITIAL_SCAN_LIMIT = int(os.environ.get("INITIAL_SCAN_LIMIT", "500"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "60"))
+# Default: one concurrent download per session (user + extras) so each
+# account's independent rate-limit bucket is used in parallel.
+_mcd = os.environ.get("MAX_CONCURRENT_DOWNLOADS", "").strip()
+MAX_CONCURRENT_DOWNLOADS = (int(_mcd) if _mcd else 0) or 1 + len(EXTRA_TOKENS)
 
 # TMDB (posters, IMDB IDs, title matching for the Stremio addon)
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
