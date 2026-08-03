@@ -50,6 +50,19 @@ def get_watcher_client() -> Client:
 _extra_clients: list[Client] = []
 _bot_clients: list[Client] = []
 _rr_idx = 0
+_broken: set[str] = set()
+
+
+class _RetryClient(Exception):
+    """Internal signal: this client cannot fetch the message, try the next one."""
+
+
+def _mark_broken(c: Client) -> None:
+    _broken.add(c.name)
+
+
+def _is_broken(c: Client) -> bool:
+    return c.name in _broken
 
 
 def _is_bot_token(tok: str) -> bool:
@@ -97,16 +110,24 @@ def _pick_dl_client(clients: list[Client]) -> Client:
 
     Bots have much higher upload.GetFile limits than user accounts, so they
     should carry downloads whenever available; the user session is only used
-    when no bot/extra sessions exist.
+    when no bot/extra sessions exist. Clients that failed the startup health
+    check (e.g. bots not added to the channel) are skipped.
     """
     global _rr_idx
-    target = _bot_clients or _extra_clients or clients
+    pool = [c for c in clients if not _is_broken(c)] or clients
+    bots = [c for c in pool if c.name.startswith("tgfiles_bot_")]
+    extras = [c for c in pool if c is not get_client()]
+    target = bots or extras or pool
     _rr_idx = (_rr_idx + 1) % len(target)
     return target[_rr_idx]
 
 
 async def start_download_clients(ref: str, chat_id: int) -> None:
-    """Connect every download client and warm its peer storage."""
+    """Connect every download client and warm its peer storage.
+
+    Clients that cannot read the target channel (e.g. bots not added as
+    admins) are marked broken and excluded from the download pool.
+    """
     for c in get_download_clients():
         try:
             if not c.is_connected:
@@ -114,9 +135,16 @@ async def start_download_clients(ref: str, chat_id: int) -> None:
             try:
                 await c.get_chat(ref)
             except Exception:
-                pass
+                _mark_broken(c)
+                continue
+            if chat_id:
+                try:
+                    async for _ in c.get_chat_history(chat_id, limit=1):
+                        break
+                except Exception:
+                    _mark_broken(c)
         except Exception:
-            continue
+            _mark_broken(c)
 
 
 async def ensure_started():
@@ -240,37 +268,53 @@ async def download_file(
         if progress_cb and total:
             progress_cb(current, total)
 
+    # If the picked client fails (e.g. bot without channel access), fall back
+    # to the main user session, which is always a member of the channel.
+    candidates = [client]
+    for c in get_download_clients():
+        if c is not client:
+            candidates.append(c)
+
     retries = 3
-    for attempt in range(retries):
-        try:
-            msg = await client.get_messages(chat_id, message_id)
-            if not msg or not msg.media:
-                finish_download(chat_id, message_id, status="no_media")
-                return None
+    for try_client in candidates:
+        for attempt in range(retries):
+            try:
+                msg = await try_client.get_messages(chat_id, message_id)
+                if not msg or not msg.media:
+                    if try_client is get_client():
+                        # User session is a channel member: message is genuinely gone.
+                        finish_download(chat_id, message_id, status="no_media")
+                        return None
+                    _mark_broken(try_client)
+                    raise _RetryClient()
+                await try_client.download_media(
+                    msg,
+                    file_name=str(out_path),
+                    progress=_progress,
+                )
+                mark_downloaded(chat_id, message_id, str(out_path))
+                finish_download(chat_id, message_id, status="done")
+                return out_path
 
-            await client.download_media(
-                msg,
-                file_name=str(out_path),
-                progress=_progress,
-            )
-            mark_downloaded(chat_id, message_id, str(out_path))
-            finish_download(chat_id, message_id, status="done")
-            return out_path
+            except _RetryClient:
+                break  # try the next client
 
-        except FileReferenceExpired:
-            await asyncio.sleep(1)
-            continue
+            except FileReferenceExpired:
+                await asyncio.sleep(1)
+                continue
 
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            continue
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                continue
 
-        except Exception as e:
-            if attempt == retries - 1:
-                finish_download(chat_id, message_id, status=f"error:{e}")
-                return None
-            await asyncio.sleep(2 ** attempt)
+            except Exception as e:
+                if try_client is not get_client():
+                    _mark_broken(try_client)
+                if attempt == retries - 1:
+                    break  # try the next client
+                await asyncio.sleep(2 ** attempt)
 
+    finish_download(chat_id, message_id, status="error:no_client_worked")
     return None
 
 
@@ -384,6 +428,8 @@ async def download_channel_all(
                               f"({meta['file_size']//1024//1024} MB) @ {dl_client.name}")
                 path = await download_file(chat_id, meta["message_id"],
                                            meta["file_name"], client=dl_client)
+                if path is None and status_cb:
+                    status_cb(f"⚠ FAIL [{meta['message_id']}] {meta['file_name']} (all clients failed)")
                 return path is not None
             except Exception as e:
                 if status_cb:
@@ -497,6 +543,8 @@ async def _download_new_meta(chat_id: int, meta: dict, status_cb=None,
                                    client=dl_client)
         if path and status_cb:
             status_cb(f"✅ NEW [{meta['message_id']}] {meta['file_name']}")
+        elif path is None and status_cb:
+            status_cb(f"⚠ FAIL NEW [{meta['message_id']}] {meta['file_name']} (all clients failed)")
     except Exception as e:
         if status_cb:
             status_cb(f"⚠ NEW [{meta['message_id']}] {meta['file_name']}: {e}")
