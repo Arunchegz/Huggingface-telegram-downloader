@@ -132,6 +132,15 @@ def mark_downloaded(chat_id: int, message_id: int, local_path: str):
         """, (local_path, chat_id, message_id))
 
 
+def clear_downloaded(chat_id: int, message_id: int):
+    """Un-mark a file as downloaded (local_path missing from storage)."""
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE files SET downloaded=0, local_path=NULL
+            WHERE chat_id=? AND message_id=?
+        """, (chat_id, message_id))
+
+
 def get_file_by_msg(chat_id: int, message_id: int):
     with get_conn() as conn:
         return conn.execute(

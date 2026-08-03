@@ -570,6 +570,27 @@ async def sync_deletions(client: Client, chat_id: int, status_cb=None,
     return removed
 
 
+async def verify_downloaded_files(chat_id: int, status_cb=None) -> int:
+    """Startup integrity check: re-flag files whose bucket object vanished.
+
+    Rows marked downloaded=1 whose local_path no longer exists on disk (HF
+    eviction, manual deletion, storage reset) get their downloaded flag cleared
+    so the initial scan re-downloads them.
+    """
+    from database import get_downloaded_rows, clear_downloaded
+    rows = get_downloaded_rows(chat_id)
+    missing = 0
+    for row in rows:
+        lp = row["local_path"]
+        if lp and Path(lp).exists():
+            continue
+        clear_downloaded(chat_id, row["message_id"])
+        missing += 1
+    if missing and status_cb:
+        status_cb(f"🔍 Integrity check: {missing} file(s) missing from storage, will re-download")
+    return missing
+
+
 async def _handle_delete_update(client: Client, update, users, chats, status_cb=None):
     """Pyrogram raw update handler — fires when messages are deleted in a channel."""
     if isinstance(update, UpdateDeleteChannelMessages):
@@ -677,6 +698,11 @@ async def auto_download_main(status_cb=None) -> None:
             _status(f"🗑 Startup deletion sync: removed {removed} file(s) deleted while offline")
     except Exception as e:
         _status(f"⚠ Deletion sync failed: {e}")
+
+    try:
+        await verify_downloaded_files(row["id"], status_cb=_status)
+    except Exception as e:
+        _status(f"⚠ Integrity check failed: {e}")
 
     count = await download_channel_all(row["id"], status_cb=_status, client=client)
     if status_cb:
