@@ -14,6 +14,7 @@ import re
 import time
 import unicodedata
 import urllib.parse
+from datetime import datetime
 from urllib.parse import quote_plus
 
 import httpx
@@ -28,11 +29,84 @@ BASE_URL = os.environ.get("ADDON_BASE_URL", "").rstrip("/")
 STORAGE_BUCKET_BASE = os.environ.get("STORAGE_BUCKET_BASE", "").rstrip("/")
 OPENSUBTITLES_BASE = "https://opensubtitles-v3.strem.io"
 
-# ── HF private bucket CDN URL resolver ───────────────────────────────────────
-# Set STORAGE_BUCKET_REPO=owner/repo-name and HF_TOKEN in env to enable.
-# On each /stream request, resolves the private bucket file to a short-lived
-# CloudFront pre-signed URL (valid ~24h) and returns it directly to Stremio.
-# Stremio streams from HF CDN — no proxying on your server.
+# ── HF bucket S3-gateway presigned URLs ──────────────────────────────────────
+# Preferred path for private buckets: the app SigV4-presigns a GET URL on
+# https://s3.hf.co (the public S3-compatible gateway). The player hits the
+# gateway directly and is 302-redirected to the PUBLIC HF CDN (us.aws.cdn.hf.co)
+# because the request originates from the player's network — avoiding the
+# internal-only cas-bridge host that the /buckets/resolve redirect uses for
+# requests made from inside HF's network.
+# Requires S3 credentials generated from a HF access token (Settings → Access
+# Tokens → Generate S3 credentials) exposed as HF_S3_ACCESS_KEY/HF_S3_SECRET_KEY.
+
+import hashlib
+import hmac
+
+HF_S3_ACCESS_KEY = os.environ.get("HF_S3_ACCESS_KEY", "")
+HF_S3_SECRET_KEY = os.environ.get("HF_S3_SECRET_KEY", "")
+HF_S3_ENDPOINT = os.environ.get("HF_S3_ENDPOINT", "https://s3.hf.co").rstrip("/")
+HF_S3_REGION = "us-east-1"
+HF_S3_SERVICE = "s3"
+HF_S3_EXPIRES = int(os.environ.get("HF_S3_EXPIRES", "3600"))
+_S3_HOST = urllib.parse.urlparse(HF_S3_ENDPOINT).netloc
+
+
+def _sigv4_sign(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _sigv4_signing_key(secret: str, date_stamp: str) -> bytes:
+    k_date = _sigv4_sign(("AWS4" + secret).encode("utf-8"), date_stamp)
+    k_region = _sigv4_sign(k_date, HF_S3_REGION)
+    k_service = _sigv4_sign(k_region, HF_S3_SERVICE)
+    return _sigv4_sign(k_service, "aws4_request")
+
+
+def presign_s3_url(chat_id: int, file_name: str, now=None) -> str:
+    """SigV4-presign a GET of bucket file via the public S3 gateway.
+
+    Returns the full presigned URL, or "" if S3 credentials are not configured.
+    """
+    if not (HF_S3_ACCESS_KEY and HF_S3_SECRET_KEY and STORAGE_BUCKET_REPO):
+        return ""
+    owner, bucket = STORAGE_BUCKET_REPO.split("/", 1)
+    key = f"{bucket}/downloads/{chat_id}/{file_name}"
+    canonical_uri = "/" + owner + "/" + urllib.parse.quote(key, safe="/~")
+
+    t = now or datetime.utcnow()
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
+    scope = f"{date_stamp}/{HF_S3_REGION}/{HF_S3_SERVICE}/aws4_request"
+
+    params = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", f"{HF_S3_ACCESS_KEY}/{scope}"),
+        ("X-Amz-Date", amz_date),
+        ("X-Amz-Expires", str(HF_S3_EXPIRES)),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    params.sort()
+    qs = "&".join(
+        f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+        for k, v in params
+    )
+
+    canonical_headers = f"host:{_S3_HOST}\n"
+    canonical_request = "\n".join([
+        "GET", canonical_uri, qs,
+        canonical_headers, "host", "UNSIGNED-PAYLOAD",
+    ])
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    signature = hmac.new(
+        _sigv4_signing_key(HF_S3_SECRET_KEY, date_stamp),
+        string_to_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{HF_S3_ENDPOINT}{canonical_uri}?{qs}&X-Amz-Signature={signature}"
+
 
 HF_BUCKET_COLLECTION = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
@@ -519,10 +593,15 @@ def _base_url(request: Request) -> str:
 async def _file_url(base: str, f: dict) -> str:
     """
     Resolve the stream URL for a file:
-    1. If STORAGE_BUCKET_REPO + HF_TOKEN set → resolve private bucket to CDN URL (per-request).
-    2. Elif STORAGE_BUCKET_BASE set → static public bucket URL (legacy).
-    3. Else → local /tgfile proxy.
+    1. If HF_S3_ACCESS_KEY/SECRET set → SigV4-presigned S3 gateway URL (private bucket, public CDN).
+    2. If STORAGE_BUCKET_REPO + HF_TOKEN set → resolve private bucket to CDN URL (legacy).
+    3. Elif STORAGE_BUCKET_BASE set → static public bucket URL (legacy).
+    4. Else → local /tgfile proxy.
     """
+    if HF_S3_ACCESS_KEY and HF_S3_SECRET_KEY:
+        presigned = presign_s3_url(f["chat_id"], f["file_name"])
+        if presigned:
+            return presigned
     if STORAGE_BUCKET_REPO and HF_TOKEN:
         cdn_url = await get_hf_cdn_url(f["chat_id"], f["file_name"])
         if cdn_url:
