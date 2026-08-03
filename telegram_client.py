@@ -38,16 +38,13 @@ def get_client() -> Client:
 
 
 def get_watcher_client() -> Client:
-    global _watcher_client
-    if _watcher_client is None:
-        _watcher_client = Client(
-            name="tgfiles_watcher",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            session_string=SESSION_STRING,
-            in_memory=True,
-        )
-    return _watcher_client
+    """The watcher is the SAME client as the browse client.
+
+    Telegram only allows one live MTProto connection per auth key. Opening a
+    second Client from the same session string kills the first connection with
+    AuthKeyDuplicated, so both roles must share the single user-session client.
+    """
+    return get_client()
 
 
 _extra_clients: list[Client] = []
@@ -58,10 +55,20 @@ def _is_bot_token(tok: str) -> bool:
 
 
 def get_download_clients() -> list[Client]:
-    """Pool of clients used for downloads: watcher session + extra sessions."""
+    """Pool of clients used for downloads: shared user client + extra sessions.
+
+    EXTRA_TOKENS must contain DISTINCT accounts (bot tokens or session strings
+    from other accounts). Any token equal to the main SESSION_STRING — or a
+    duplicate of another token — is skipped, since connecting it alongside the
+    main client triggers AuthKeyDuplicated.
+    """
     global _extra_clients
     if not _extra_clients:
+        seen = {SESSION_STRING}
         for i, tok in enumerate(EXTRA_TOKENS):
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
             if _is_bot_token(tok):
                 _extra_clients.append(Client(
                     name=f"tgfiles_bot_{i}",
