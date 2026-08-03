@@ -156,6 +156,16 @@ def finish_download(chat_id, message_id, status="done"):
         """, (datetime.utcnow().isoformat(), status, chat_id, message_id))
 
 
+def get_downloaded_rows(chat_id: int):
+    """All downloaded file rows for a chat (message_id, local_path, file_name)."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT message_id, local_path, file_name FROM files "
+            "WHERE chat_id=? AND downloaded=1",
+            (chat_id,)
+        ).fetchall()
+
+
 def delete_file_row(chat_id: int, message_id: int) -> dict | None:
     """Delete DB row for (chat_id, message_id). Returns {local_path, file_name} if it existed."""
     with get_conn() as conn:

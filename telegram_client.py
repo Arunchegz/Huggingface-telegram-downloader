@@ -520,6 +520,56 @@ async def _on_new_channel_message(client: Client, message: Message, status_cb=No
     await _download_new_meta(chat.id, meta, status_cb=status_cb)
 
 
+async def _remove_downloaded_file(chat_id: int, mid: int, status_cb=None) -> None:
+    """Delete DB row + local file (mounted bucket) for (chat_id, mid)."""
+    info = delete_file_row(chat_id, mid)
+    if not info:
+        return
+    local_path, file_name = info["local_path"], info["file_name"]
+    p = Path(local_path) if local_path else None
+    if p and p.exists():
+        try:
+            p.unlink()
+        except OSError as e:
+            if status_cb:
+                status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
+            return
+    delete_bucket_file(chat_id, file_name)
+    if status_cb:
+        status_cb(f"🗑 Deleted [{chat_id}/{mid}] {file_name}")
+
+
+async def sync_deletions(client: Client, chat_id: int, status_cb=None,
+                         limit: int = INITIAL_SCAN_LIMIT) -> int:
+    """Startup catch-up: remove files whose messages were deleted while offline.
+
+    Fetches the newest `limit` message IDs of the channel; any downloaded DB row
+    inside that range that is missing from the live set was deleted while the
+    app was not running.
+    """
+    from database import get_downloaded_rows
+    rows = get_downloaded_rows(chat_id)
+    if not rows:
+        return 0
+    live_ids: set[int] = set()
+    oldest = None
+    async for msg in client.get_chat_history(chat_id, limit=limit):
+        live_ids.add(msg.id)
+        if oldest is None or msg.id < oldest:
+            oldest = msg.id
+    if not live_ids or oldest is None:
+        return 0
+    removed = 0
+    for row in rows:
+        mid = row["message_id"]
+        if mid < oldest:
+            continue  # outside fetched range, status unknown
+        if mid not in live_ids:
+            await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
+            removed += 1
+    return removed
+
+
 async def _handle_delete_update(client: Client, update, users, chats, status_cb=None):
     """Pyrogram raw update handler — fires when messages are deleted in a channel."""
     if isinstance(update, UpdateDeleteChannelMessages):
@@ -535,41 +585,17 @@ async def _handle_delete_update(client: Client, update, users, chats, status_cb=
 
     for mid in msg_ids:
         if chat_id is not None:
-            info = delete_file_row(chat_id, mid)
-            if info:
-                local_path, file_name = info["local_path"], info["file_name"]
-                p = Path(local_path) if local_path else None
-                if p and p.exists():
-                    try:
-                        p.unlink()
-                    except OSError as e:
-                        if status_cb:
-                            status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
-                        continue
-                delete_bucket_file(chat_id, file_name)
-                if status_cb:
-                    status_cb(f"🗑 Deleted [{chat_id}/{mid}] {file_name}")
+            await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
         else:
             # Try all chats for this message_id (rare: non-channel delete)
             from database import get_conn
             with get_conn() as conn:
                 rows = conn.execute(
-                    "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND downloaded=1",
+                    "SELECT chat_id FROM files WHERE message_id=? AND downloaded=1",
                     (mid,)
                 ).fetchall()
             for row in rows:
-                info = delete_file_row(row["chat_id"], mid)
-                if info:
-                    file_name = info["file_name"]
-                    p = Path(info["local_path"]) if info["local_path"] else None
-                    if p and p.exists():
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-                    delete_bucket_file(row["chat_id"], file_name)
-                    if status_cb:
-                        status_cb(f"🗑 Deleted [{row['chat_id']}/{mid}] {file_name}")
+                await _remove_downloaded_file(row["chat_id"], mid, status_cb=status_cb)
 
 
 def _register_delete_handler(client: Client, status_cb=None):
@@ -644,6 +670,13 @@ async def auto_download_main(status_cb=None) -> None:
         if status_cb:
             status_cb(f"🔌 Extra download sessions: {len(extras)}")
         await start_download_clients(ref, row["id"])
+
+    try:
+        removed = await sync_deletions(client, row["id"], status_cb=_status)
+        if removed:
+            _status(f"🗑 Startup deletion sync: removed {removed} file(s) deleted while offline")
+    except Exception as e:
+        _status(f"⚠ Deletion sync failed: {e}")
 
     count = await download_channel_all(row["id"], status_cb=_status, client=client)
     if status_cb:
