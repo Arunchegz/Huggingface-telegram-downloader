@@ -28,12 +28,18 @@ def start_auto_downloader():
         print(f"[auto] {msg}")
 
     def _run():
-        try:
-            asyncio.run(auto_download_main(status_cb=_status))
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[auto] FATAL: {e}")
+        import traceback
+        backoff = 30
+        while True:
+            try:
+                asyncio.run(auto_download_main(status_cb=_status))
+                break  # clean exit (e.g. CHANNEL_REF not set)
+            except Exception as e:
+                traceback.print_exc()
+                print(f"[auto] CRASHED: {e} — restarting in {backoff}s")
+                import time as _t
+                _t.sleep(backoff)
+                backoff = min(backoff * 2, 300)  # cap at 5 min
 
     t = threading.Thread(target=_run, daemon=True, name="auto-downloader")
     t.start()

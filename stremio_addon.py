@@ -8,13 +8,14 @@ Endpoints:
   /subtitles/{type}/{id}.json
   /tgfile/{chat_id}/{message_id}  (HTTP Range streaming)
 """
+import asyncio
 import mimetypes
 import os
 import re
 import time
 import unicodedata
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote_plus
 
 import httpx
@@ -73,7 +74,7 @@ def presign_s3_url(chat_id: int, file_name: str, now=None) -> str:
     key = f"{bucket}/downloads/{chat_id}/{file_name}"
     canonical_uri = "/" + owner + "/" + urllib.parse.quote(key, safe="/~")
 
-    t = now or datetime.utcnow()
+    t = now or datetime.now(timezone.utc)
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = t.strftime("%Y%m%d")
     scope = f"{date_stamp}/{HF_S3_REGION}/{HF_S3_SERVICE}/aws4_request"
@@ -176,6 +177,7 @@ MANIFEST = {
 
 _cache: dict[str, tuple[float, str, str]] = {}  # key -> (expire_ts, poster, imdb_id)
 _CACHE_TTL = 86400
+_title_cache: dict[str, tuple[float, str, str, list]] = {}  # imdb_id -> (expire_ts, name, year, candidates)
 
 
 def _cache_get(key: str):
@@ -186,6 +188,12 @@ def _cache_get(key: str):
 
 
 def _cache_set(key: str, poster: str, imdb_id: str):
+    # Evict expired entries periodically to prevent unbounded growth
+    if len(_cache) > 500:
+        now = time.time()
+        expired = [k for k, v in _cache.items() if v[0] <= now]
+        for k in expired:
+            del _cache[k]
     _cache[key] = (time.time() + _CACHE_TTL, poster, imdb_id)
 
 
@@ -508,10 +516,14 @@ async def get_title_info(type_name: str, imdb_id: str) -> tuple[str, str, list[s
     """Returns (name, year, candidate_titles) for a tt ID.
 
     TMDB find is primary (localized + original_title + alternative_titles);
-    Cinemeta is the fallback.
+    Cinemeta is the fallback. Results are cached for 24h.
     """
     if not imdb_id.startswith("tt"):
         return "", "", []
+    cache_key = f"{type_name}:{imdb_id}"
+    entry = _title_cache.get(cache_key)
+    if entry and entry[0] > time.time():
+        return entry[1], entry[2], entry[3]
     if TMDB_API_KEY:
         media = _tmdb_media(type_name == "series")
         try:
@@ -543,7 +555,9 @@ async def get_title_info(type_name: str, imdb_id: str) -> tuple[str, str, list[s
                                 known.add(t.lower())
                     except Exception as e:
                         print(f"[tmdb] alt titles failed for {imdb_id}: {e}")
-                    return name or original, year, candidates
+                    result = (name or original, year, candidates)
+                    _title_cache[cache_key] = (time.time() + _CACHE_TTL, result[0], result[1], result[2])
+                    return result
         except Exception as e:
             print(f"[tmdb] find failed for {imdb_id}: {e}")
     try:
@@ -551,7 +565,9 @@ async def get_title_info(type_name: str, imdb_id: str) -> tuple[str, str, list[s
             r = await c.get(f"https://v3-cinemeta.strem.io/meta/{type_name}/{imdb_id}.json")
             meta = r.json().get("meta", {}) or {}
             name = meta.get("name", "")
-            return name, str(meta.get("year", "") or ""), [name] if name else []
+            result = (name, str(meta.get("year", "") or ""), [name] if name else [])
+            _title_cache[cache_key] = (time.time() + _CACHE_TTL, result[0], result[1], result[2])
+            return result
     except Exception as e:
         print(f"[cinemeta] failed for {imdb_id}: {e}")
     return "", "", []
@@ -869,7 +885,7 @@ def add_routes(app: FastAPI):
         os_id = imdb_id if type == "movie" else f"{imdb_id}:{season}:{episode}"
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"https://opensubtitles-v3.strem.io/subtitles/{type}/{os_id}.json")
+                r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
                 if r.status_code == 200:
                     return JSONResponse(r.json())
         except Exception as e:
