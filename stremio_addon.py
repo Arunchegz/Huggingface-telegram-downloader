@@ -415,6 +415,9 @@ async def _tmdb_search(filename: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=8) as c:
             r = await c.get(f"{TMDB_BASE}/search/{media}", params=params)
+            if r.status_code == 429:
+                await asyncio.sleep(2.0)
+                r = await c.get(f"{TMDB_BASE}/search/{media}", params=params)
             results = r.json().get("results", [])
             if not results:
                 return None
@@ -434,10 +437,18 @@ async def _tmdb_search(filename: str) -> dict | None:
             imdb_id = ""
             r2 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/external_ids",
                              params={"api_key": TMDB_API_KEY})
+            if r2.status_code == 429:
+                await asyncio.sleep(2.0)
+                r2 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/external_ids",
+                                 params={"api_key": TMDB_API_KEY})
             imdb_id = r2.json().get("imdb_id") or ""
             alt_titles = []
             r3 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/alternative_titles",
                              params={"api_key": TMDB_API_KEY})
+            if r3.status_code == 429:
+                await asyncio.sleep(2.0)
+                r3 = await c.get(f"{TMDB_BASE}/{media}/{tmdb_id}/alternative_titles",
+                                 params={"api_key": TMDB_API_KEY})
             entries = r3.json().get("titles") or r3.json().get("results") or []
             for e in entries:
                 t = _clean_alt_title(e.get("title", ""))

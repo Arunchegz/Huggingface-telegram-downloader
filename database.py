@@ -2,14 +2,14 @@ import sqlite3
 import json
 from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from config import DB_PATH
 
 
 @contextmanager
 def get_conn():
     """Context manager that opens, yields, commits/rolls back, and closes the connection."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -154,7 +154,7 @@ def log_download(chat_id, message_id, file_name, status="pending"):
         conn.execute("""
             INSERT INTO downloads (chat_id, message_id, file_name, started_at, status)
             VALUES (?, ?, ?, ?, ?)
-        """, (chat_id, message_id, file_name, datetime.utcnow().isoformat(), status))
+        """, (chat_id, message_id, file_name, datetime.now(timezone.utc).isoformat(), status))
 
 
 def finish_download(chat_id, message_id, status="done"):
@@ -162,7 +162,7 @@ def finish_download(chat_id, message_id, status="done"):
         conn.execute("""
             UPDATE downloads SET finished_at=?, status=?
             WHERE chat_id=? AND message_id=? AND finished_at IS NULL
-        """, (datetime.utcnow().isoformat(), status, chat_id, message_id))
+        """, (datetime.now(timezone.utc).isoformat(), status, chat_id, message_id))
 
 
 def get_downloaded_rows(chat_id: int):

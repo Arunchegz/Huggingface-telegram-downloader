@@ -3,7 +3,8 @@ import json
 import os
 import re
 from pathlib import Path
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, FileReferenceExpired
@@ -50,7 +51,7 @@ def get_watcher_client() -> Client:
 _extra_clients: list[Client] = []
 _bot_clients: list[Client] = []
 _rr_idx = 0
-_broken: set[str] = set()
+_broken: dict[str, float] = {}  # client_name -> expiry timestamp
 
 
 class _RetryClient(Exception):
@@ -58,11 +59,17 @@ class _RetryClient(Exception):
 
 
 def _mark_broken(c: Client) -> None:
-    _broken.add(c.name)
+    _broken[c.name] = time.time() + 3600  # exclude for 1 hour
 
 
 def _is_broken(c: Client) -> bool:
-    return c.name in _broken
+    expiry = _broken.get(c.name)
+    if expiry is None:
+        return False
+    if time.time() > expiry:
+        del _broken[c.name]
+        return False
+    return True
 
 
 def _is_bot_token(tok: str) -> bool:
@@ -199,7 +206,7 @@ def _extract_file_meta(msg: Message) -> dict | None:
         "mime_type": mime_type,
         "ext": ext,
         "media_type": _detect_media_type(ext),
-        "date": msg.date.isoformat() if msg.date else datetime.utcnow().isoformat(),
+        "date": msg.date.isoformat() if msg.date else datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -216,7 +223,7 @@ async def fetch_chats() -> list[dict]:
             "title": chat.title or chat.first_name or str(chat.id),
             "type": str(chat.type),
             "username": chat.username or "",
-            "last_synced": datetime.utcnow().isoformat(),
+            "last_synced": datetime.now(timezone.utc).isoformat(),
         }
         upsert_chat(row)
         chats.append(row)
@@ -343,7 +350,7 @@ async def resolve_chat(ref: str) -> dict:
         "title": chat.title or chat.first_name or str(chat.id),
         "type": str(chat.type),
         "username": chat.username or "",
-        "last_synced": datetime.utcnow().isoformat(),
+        "last_synced": datetime.now(timezone.utc).isoformat(),
     }
     upsert_chat(row)
     return row
@@ -714,7 +721,7 @@ async def auto_download_main(status_cb=None) -> None:
         "title": chat.title or chat.first_name or str(chat.id),
         "type": str(chat.type),
         "username": chat.username or "",
-        "last_synced": datetime.utcnow().isoformat(),
+        "last_synced": datetime.now(timezone.utc).isoformat(),
     }
     upsert_chat(row)
     if status_cb:

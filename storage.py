@@ -3,6 +3,8 @@ import shutil
 from pathlib import Path
 from typing import Generator
 
+import aiofiles
+
 from config import DOWNLOAD_DIR, MAX_CACHE_BYTES
 from database import get_conn
 
@@ -43,24 +45,25 @@ def evict_lru(needed_bytes: int = 0) -> list[str]:
     If needed_bytes > 0, also ensure that much free space exists.
     Returns list of deleted file names.
     """
-    deleted = []
     files = get_all_cached_files()
+    current_size = sum(p.stat().st_size for p in files)
+    free_space = shutil.disk_usage(DOWNLOAD_DIR).free
+    deleted = []
 
     for path in files:
-        current = get_cache_size()
-        free = shutil.disk_usage(DOWNLOAD_DIR).free
-
-        over_limit = current > MAX_CACHE_BYTES
-        not_enough_free = needed_bytes > 0 and free < needed_bytes
+        over_limit = current_size > MAX_CACHE_BYTES
+        not_enough_free = needed_bytes > 0 and free_space < needed_bytes
 
         if not over_limit and not not_enough_free:
             break
 
         try:
-            name = path.name
+            file_size = path.stat().st_size
             path.unlink()
             _clear_db_path(path)
-            deleted.append(name)
+            deleted.append(path.name)
+            current_size -= file_size
+            free_space += file_size
         except OSError:
             continue
 
@@ -132,16 +135,16 @@ def clear_all_cache() -> int:
 
 # ── file serving ──────────────────────────────────────────────────────────────
 
-def iter_file_chunks(path: Path, start: int = 0, end: int = None, chunk: int = 65536) -> Generator[bytes, None, None]:
-    """Yield byte chunks from file for range-aware streaming."""
+async def iter_file_chunks(path: Path, start: int = 0, end: int = None, chunk: int = 65536):
+    """Async generator: yield byte chunks for range-aware streaming without blocking thread pool."""
     size = path.stat().st_size
     end = end if end is not None else size - 1
     pos = start
-    with open(path, "rb") as f:
-        f.seek(start)
+    async with aiofiles.open(path, "rb") as f:
+        await f.seek(start)
         while pos <= end:
             to_read = min(chunk, end - pos + 1)
-            data = f.read(to_read)
+            data = await f.read(to_read)
             if not data:
                 break
             yield data
