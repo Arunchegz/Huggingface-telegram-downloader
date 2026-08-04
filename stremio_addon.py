@@ -893,10 +893,8 @@ def add_routes(app: FastAPI):
 
         return JSONResponse({"subtitles": []})
 
-    @app.api_route("/tgfile/{chat_id}/{message_id}", methods=["GET", "HEAD"])
-    @app.api_route("/tgfile/{chat_id}/{message_id}/{file_name}", methods=["GET", "HEAD"])
-    async def serve_file(chat_id: int, message_id: int, request: Request,
-                         file_name: str = None):
+    async def _serve_file_impl(chat_id: int, message_id: int, request: Request,
+                               file_name: str = None):
         path = resolve_local_path(chat_id, message_id)
         if path is None:
             return Response(status_code=404, content="Not found")
@@ -945,3 +943,13 @@ def add_routes(app: FastAPI):
             iter_file_chunks(path),
             status_code=200, headers=headers,
         )
+
+    @app.api_route("/tgfile/{chat_id}/{message_id}", methods=["GET", "HEAD"],
+                   operation_id="serve_file_no_name")
+    async def serve_file(chat_id: int, message_id: int, request: Request):
+        return await _serve_file_impl(chat_id, message_id, request)
+
+    @app.api_route("/tgfile/{chat_id}/{message_id}/{file_name}", methods=["GET", "HEAD"],
+                   operation_id="serve_file_with_name")
+    async def serve_file_named(chat_id: int, message_id: int, file_name: str, request: Request):
+        return await _serve_file_impl(chat_id, message_id, request, file_name)
