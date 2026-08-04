@@ -944,12 +944,18 @@ def add_routes(app: FastAPI):
             status_code=200, headers=headers,
         )
 
-    @app.api_route("/tgfile/{chat_id}/{message_id}", methods=["GET", "HEAD"],
-                   operation_id="serve_file_no_name")
-    async def serve_file(chat_id: int, message_id: int, request: Request):
+    @app.get("/tgfile/{chat_id}/{message_id}", operation_id="serve_file_get")
+    async def serve_file_get(chat_id: int, message_id: int, request: Request):
         return await _serve_file_impl(chat_id, message_id, request)
 
-    @app.api_route("/tgfile/{chat_id}/{message_id}/{file_name}", methods=["GET", "HEAD"],
-                   operation_id="serve_file_with_name")
-    async def serve_file_named(chat_id: int, message_id: int, file_name: str, request: Request):
+    @app.head("/tgfile/{chat_id}/{message_id}", operation_id="serve_file_head")
+    async def serve_file_head(chat_id: int, message_id: int, request: Request):
+        return await _serve_file_impl(chat_id, message_id, request)
+
+    @app.get("/tgfile/{chat_id}/{message_id}/{file_name}", operation_id="serve_file_named_get")
+    async def serve_file_named_get(chat_id: int, message_id: int, file_name: str, request: Request):
+        return await _serve_file_impl(chat_id, message_id, request, file_name)
+
+    @app.head("/tgfile/{chat_id}/{message_id}/{file_name}", operation_id="serve_file_named_head")
+    async def serve_file_named_head(chat_id: int, message_id: int, file_name: str, request: Request):
         return await _serve_file_impl(chat_id, message_id, request, file_name)
