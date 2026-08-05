@@ -581,22 +581,28 @@ async def _on_new_channel_message(client: Client, message: Message, status_cb=No
     await _download_new_meta(chat.id, meta, status_cb=status_cb)
 
 
-async def _remove_downloaded_file(chat_id: int, mid: int, status_cb=None) -> None:
-    """Delete local file (mounted bucket) + DB row for (chat_id, mid).
-
-    Order: disk unlink first, then DB row delete.  This way, if unlink fails
-    the row survives and the next startup sync can retry.  bucket.py is called
-    last as a no-op on HF Spaces (the unlink already synced the bucket) or as
-    the real delete call on other backends.
-    """
+async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None) -> None:
+    """Delete local file (mounted bucket) + DB row for (chat_id, mid)."""
     from database import get_conn
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT local_path, file_name FROM files WHERE chat_id=? AND message_id=?",
-            (chat_id, mid)
-        ).fetchone()
+        row = None
+        if chat_id is not None:
+            # Match exact chat_id or flexible channel ID variants
+            alt_id1 = abs(chat_id)
+            alt_id2 = int(str(alt_id1).replace("100", "", 1)) if str(alt_id1).startswith("100") else alt_id1
+            row = conn.execute(
+                "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND (chat_id=? OR chat_id=? OR chat_id=?)",
+                (mid, chat_id, alt_id1, -alt_id2)
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT chat_id, local_path, file_name FROM files WHERE message_id=?",
+                (mid,)
+            ).fetchone()
+
     if not row:
         return
+    real_chat_id = row["chat_id"]
     local_path, file_name = row["local_path"], row["file_name"]
 
     if local_path:
@@ -606,15 +612,13 @@ async def _remove_downloaded_file(chat_id: int, mid: int, status_cb=None) -> Non
                 p.unlink()
             except OSError as e:
                 if status_cb:
-                    status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
+                    status_cb(f"⚠ delete local file failed [{real_chat_id}/{mid}]: {e}")
                 return  # leave DB row intact so startup sync can retry
 
-    # DB row removed only after successful (or skipped) disk delete
-    delete_file_row(chat_id, mid)
-    # Always attempt bucket delete (no-op on HF Spaces; real call on other backends)
-    delete_bucket_file(chat_id, file_name)
+    delete_file_row(real_chat_id, mid)
+    delete_bucket_file(real_chat_id, file_name)
     if status_cb:
-        status_cb(f"🗑 Deleted [{chat_id}/{mid}] {file_name}")
+        status_cb(f"🗑 Deleted [{real_chat_id}/{mid}] {file_name}")
 
 
 async def sync_deletions(client: Client, chat_id: int, status_cb=None,
@@ -669,32 +673,35 @@ async def verify_downloaded_files(chat_id: int, status_cb=None) -> int:
     return missing
 
 
-async def _handle_delete_update(client: Client, update, users, chats, status_cb=None):
-    """Pyrogram raw update handler — fires when messages are deleted in a channel."""
-    if isinstance(update, UpdateDeleteChannelMessages):
-        # Reconstruct Pyrogram-style channel peer ID
-        chat_id = int(f"-100{update.channel_id}")
-        msg_ids = update.messages
-    elif isinstance(update, UpdateDeleteMessages):
-        # Private/group messages: no channel_id in update, handle per stored rows
-        chat_id = None
-        msg_ids = update.messages
-    else:
-        return
+def _extract_raw_updates(update) -> list:
+    """Unpack MTProto update containers (Updates, UpdateShort, UpdatesCombined)."""
+    if hasattr(update, "updates") and isinstance(getattr(update, "updates"), list):
+        return getattr(update, "updates")
+    if hasattr(update, "update") and getattr(update, "update"):
+        return [getattr(update, "update")]
+    return [update]
 
-    for mid in msg_ids:
-        if chat_id is not None:
-            await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
+
+async def _handle_delete_update(client: Client, raw_update, users, chats, status_cb=None):
+    """Pyrogram raw update handler — fires when messages are deleted in a channel."""
+    sub_updates = _extract_raw_updates(raw_update)
+    for u in sub_updates:
+        chat_id = None
+        msg_ids = []
+        if isinstance(u, UpdateDeleteChannelMessages):
+            channel_id = getattr(u, "channel_id", None)
+            if channel_id:
+                chat_id = int(f"-100{channel_id}")
+            msg_ids = getattr(u, "messages", []) or []
+        elif isinstance(u, UpdateDeleteMessages):
+            msg_ids = getattr(u, "messages", []) or []
         else:
-            # Try all chats for this message_id (rare: non-channel delete)
-            from database import get_conn
-            with get_conn() as conn:
-                rows = conn.execute(
-                    "SELECT chat_id FROM files WHERE message_id=? AND downloaded=1",
-                    (mid,)
-                ).fetchall()
-            for row in rows:
-                await _remove_downloaded_file(row["chat_id"], mid, status_cb=status_cb)
+            continue
+
+        for mid in msg_ids:
+            if status_cb:
+                status_cb(f"🗑 Received deletion update for message_id {mid}")
+            await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
 
 
 def _register_delete_handler(client: Client, status_cb=None):
