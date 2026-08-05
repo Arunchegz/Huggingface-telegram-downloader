@@ -161,10 +161,15 @@ async def ensure_started():
 
 
 async def stop_client():
-    global _client
+    global _client, _extra_clients, _bot_clients
     if _client and _client.is_connected:
         await _client.stop()
     _client = None
+    for c in _extra_clients:
+        if c and c.is_connected:
+            await c.stop()
+    _extra_clients = []
+    _bot_clients = []
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -225,7 +230,7 @@ async def fetch_chats() -> list[dict]:
             "username": chat.username or "",
             "last_synced": datetime.now(timezone.utc).isoformat(),
         }
-        upsert_chat(row)
+        await asyncio.to_thread(upsert_chat, row)
         chats.append(row)
     return chats
 
@@ -238,7 +243,7 @@ async def scan_chat(chat_id: int, limit: int = 200, progress_cb=None) -> int:
     async for msg in client.get_chat_history(chat_id, limit=limit):
         meta = _extract_file_meta(msg)
         if meta:
-            upsert_file(meta)
+            await asyncio.to_thread(upsert_file, meta)
             count += 1
             if progress_cb:
                 progress_cb(count)
@@ -352,7 +357,7 @@ async def resolve_chat(ref: str) -> dict:
         "username": chat.username or "",
         "last_synced": datetime.now(timezone.utc).isoformat(),
     }
-    upsert_chat(row)
+    await asyncio.to_thread(upsert_chat, row)
     return row
 
 
@@ -403,8 +408,9 @@ async def download_channel_all(
         meta = _extract_file_meta(msg)
         if not meta:
             continue
-        upsert_file(meta)
-        if msg.id <= last_id and _is_downloaded(chat_id, msg.id):
+        await asyncio.to_thread(upsert_file, meta)
+        is_dl = await asyncio.to_thread(_is_downloaded, chat_id, msg.id)
+        if msg.id <= last_id and is_dl:
             continue
         if _cache_full(meta["file_size"]):
             if status_cb:
@@ -414,7 +420,7 @@ async def download_channel_all(
         last_id = max(last_id, msg.id)
         await asyncio.sleep(0)
 
-    _save_last_msg_id(chat_id, last_id)
+    await asyncio.to_thread(_save_last_msg_id, chat_id, last_id)
 
     if not pending:
         return 0
@@ -470,7 +476,7 @@ async def watch_channel_new(
                 meta = _extract_file_meta(msg)
                 if not meta:
                     continue
-                upsert_file(meta)
+                await asyncio.to_thread(upsert_file, meta)
                 if msg.id <= last_id:
                     break
                 if _cache_full(meta["file_size"]):
@@ -482,7 +488,7 @@ async def watch_channel_new(
                 await asyncio.sleep(0)
             if newest_id > last_id:
                 last_id = newest_id
-                _save_last_msg_id(chat_id, last_id)
+                await asyncio.to_thread(_save_last_msg_id, chat_id, last_id)
 
             if pending:
                 for meta in pending:
@@ -567,11 +573,11 @@ async def _on_new_channel_message(client: Client, message: Message, status_cb=No
     meta = _extract_file_meta(message)
     if not meta:
         return
-    upsert_file(meta)
-    last_id = get_last_msg_id(chat.id)
+    await asyncio.to_thread(upsert_file, meta)
+    last_id = await asyncio.to_thread(get_last_msg_id, chat.id)
     if message.id <= last_id:
         return
-    _save_last_msg_id(chat.id, message.id)
+    await asyncio.to_thread(_save_last_msg_id, chat.id, message.id)
     await _download_new_meta(chat.id, meta, status_cb=status_cb)
 
 
@@ -740,7 +746,7 @@ async def auto_download_main(status_cb=None) -> None:
         "username": chat.username or "",
         "last_synced": datetime.now(timezone.utc).isoformat(),
     }
-    upsert_chat(row)
+    await asyncio.to_thread(upsert_chat, row)
     if status_cb:
         status_cb(f"📡 Channel: {row['title']} (ID {row['id']})")
 

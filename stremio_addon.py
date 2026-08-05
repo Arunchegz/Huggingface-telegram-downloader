@@ -127,6 +127,16 @@ def _hf_bucket_url(chat_id: int, file_name: str) -> str:
     )
 
 
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=10, follow_redirects=False)
+    return _http_client
+
+
 async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
     """
     Resolve a private HF bucket file to a CloudFront pre-signed CDN URL.
@@ -139,18 +149,18 @@ async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
     if not bucket_url:
         return ""
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as c:
-            r = await c.get(
-                bucket_url,
-                headers={"Authorization": f"Bearer {HF_TOKEN}"},
-                params={"download": "true"},
-            )
-            if r.status_code in (301, 302, 303, 307, 308):
-                cdn_url = r.headers.get("location", "")
-                if cdn_url:
-                    return cdn_url
-            # Some HF responses return 200 with a redirect body — try anyway
-            print(f"[hf-bucket] unexpected status {r.status_code} for {file_name}")
+        c = get_http_client()
+        r = await c.get(
+            bucket_url,
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            params={"download": "true"},
+        )
+        if r.status_code in (301, 302, 303, 307, 308):
+            cdn_url = r.headers.get("location", "")
+            if cdn_url:
+                return cdn_url
+        # Some HF responses return 200 with a redirect body — try anyway
+        print(f"[hf-bucket] unexpected status {r.status_code} for {file_name}")
     except Exception as e:
         print(f"[hf-bucket] CDN URL resolve failed for {file_name!r}: {e}")
     return ""
@@ -838,10 +848,10 @@ def add_routes(app: FastAPI):
             # Can proxy directly with the imdb_id we already have
             os_id = imdb_id if type == "movie" else f"{imdb_id}:{season}:{episode}"
             try:
-                async with httpx.AsyncClient(timeout=10) as c:
-                    r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
-                    if r.status_code == 200:
-                        return JSONResponse(r.json())
+                c = get_http_client()
+                r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
+                if r.status_code == 200:
+                    return JSONResponse(r.json())
             except Exception as e:
                 print(f"[subtitles] opensubtitles failed for {imdb_id}: {e}")
             return JSONResponse({"subtitles": []})
@@ -884,10 +894,10 @@ def add_routes(app: FastAPI):
 
         os_id = imdb_id if type == "movie" else f"{imdb_id}:{season}:{episode}"
         try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
-                if r.status_code == 200:
-                    return JSONResponse(r.json())
+            c = get_http_client()
+            r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
+            if r.status_code == 200:
+                return JSONResponse(r.json())
         except Exception as e:
             print(f"[subtitles] opensubtitles failed for {imdb_id}: {e}")
 

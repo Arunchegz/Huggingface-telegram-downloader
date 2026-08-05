@@ -16,6 +16,11 @@ from pathlib import Path
 from config import DOWNLOAD_DIR
 
 
+import logging
+
+logger = logging.getLogger("tgmanager.bucket")
+
+
 def delete_bucket_file(chat_id: int, file_name: str) -> bool:
     """Delete a file from the bucket.
 
@@ -35,8 +40,8 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
     if local_path.exists():
         try:
             local_path.unlink()
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning(f"Failed to unlink local file {local_path}: {e}")
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     space_id = os.environ.get("SPACE_ID")  # e.g. "username/space-name"
@@ -51,8 +56,8 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
                 repo_id=space_id,
                 repo_type="space",
             )
-        except Exception:
-            # File may already be gone; not fatal
-            pass
+        except Exception as e:
+            # File may already be gone; log warning
+            logger.warning(f"HF Hub delete_file failed for {chat_id}/{file_name}: {e}")
 
     return True

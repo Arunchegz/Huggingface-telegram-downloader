@@ -159,7 +159,8 @@ def resolve_local_path(chat_id: int, message_id: int) -> Path | None:
             (chat_id, message_id)
         ).fetchone()
     if row and row["local_path"]:
-        p = Path(row["local_path"])
-        if p.exists():
+        p = Path(row["local_path"]).resolve()
+        download_root = DOWNLOAD_DIR.resolve()
+        if p.exists() and p.is_relative_to(download_root):
             return p
     return None
