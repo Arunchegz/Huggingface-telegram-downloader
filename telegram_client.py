@@ -576,19 +576,36 @@ async def _on_new_channel_message(client: Client, message: Message, status_cb=No
 
 
 async def _remove_downloaded_file(chat_id: int, mid: int, status_cb=None) -> None:
-    """Delete DB row + local file (mounted bucket) for (chat_id, mid)."""
-    info = delete_file_row(chat_id, mid)
-    if not info:
+    """Delete local file (mounted bucket) + DB row for (chat_id, mid).
+
+    Order: disk unlink first, then DB row delete.  This way, if unlink fails
+    the row survives and the next startup sync can retry.  bucket.py is called
+    last as a no-op on HF Spaces (the unlink already synced the bucket) or as
+    the real delete call on other backends.
+    """
+    from database import get_conn
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT local_path, file_name FROM files WHERE chat_id=? AND message_id=?",
+            (chat_id, mid)
+        ).fetchone()
+    if not row:
         return
-    local_path, file_name = info["local_path"], info["file_name"]
-    p = Path(local_path) if local_path else None
-    if p and p.exists():
-        try:
-            p.unlink()
-        except OSError as e:
-            if status_cb:
-                status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
-            return
+    local_path, file_name = row["local_path"], row["file_name"]
+
+    if local_path:
+        p = Path(local_path)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError as e:
+                if status_cb:
+                    status_cb(f"⚠ delete local file failed [{chat_id}/{mid}]: {e}")
+                return  # leave DB row intact so startup sync can retry
+
+    # DB row removed only after successful (or skipped) disk delete
+    delete_file_row(chat_id, mid)
+    # Always attempt bucket delete (no-op on HF Spaces; real call on other backends)
     delete_bucket_file(chat_id, file_name)
     if status_cb:
         status_cb(f"🗑 Deleted [{chat_id}/{mid}] {file_name}")
