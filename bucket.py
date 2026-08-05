@@ -44,20 +44,22 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
             logger.warning(f"Failed to unlink local file {local_path}: {e}")
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    space_id = os.environ.get("SPACE_ID")  # e.g. "username/space-name"
+    repo = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
+    repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
+    collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
-    if hf_token and space_id:
+    if hf_token and repo:
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
-            repo_path = f"{chat_id}/{file_name}"
+            repo_path = f"{collection}/{chat_id}/{file_name}"
             api.delete_file(
                 path_in_repo=repo_path,
-                repo_id=space_id,
-                repo_type="space",
+                repo_id=repo,
+                repo_type=repo_type,
             )
         except Exception as e:
-            # File may already be gone; log warning
-            logger.warning(f"HF Hub delete_file failed for {chat_id}/{file_name}: {e}")
+            # File may already be gone or not present in bucket; log info
+            logger.info(f"HF Hub delete_file [{repo_path}]: {e}")
 
     return True
