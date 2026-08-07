@@ -188,6 +188,8 @@ MANIFEST = {
 _cache: dict[str, tuple[float, str, str]] = {}  # key -> (expire_ts, poster, imdb_id)
 _CACHE_TTL = 86400
 _title_cache: dict[str, tuple[float, str, str, list]] = {}  # imdb_id -> (expire_ts, name, year, candidates)
+_sub_cache: dict[str, tuple[float, dict]] = {}  # os_id -> (expire_ts, opensubtitles payload)
+_SUB_CACHE_TTL = 3600
 
 
 def _cache_get(key: str):
@@ -828,6 +830,37 @@ def add_routes(app: FastAPI):
 
     @app.get("/subtitles/{type}/{item_id}.json")
     async def subtitles(type: str, item_id: str):
+        def _ok(data: dict, os_id: str) -> JSONResponse:
+            resp = JSONResponse(data)
+            resp.headers["Cache-Control"] = f"public, max-age={_SUB_CACHE_TTL}"
+            return resp
+
+        async def _query_os(type: str, os_id: str, season: int, episode: int) -> JSONResponse:
+            if type == "series" and (season is None or episode is None):
+                print(f"[subtitles] Skipping series {os_id}: missing season/episode")
+                return _ok({"subtitles": []}, os_id)
+            key = f"{type}:{os_id}"
+            entry = _sub_cache.get(key)
+            if entry and entry[0] > time.time():
+                print(f"[subtitles] Cache hit for {key}")
+                return _ok(entry[1], os_id)
+            try:
+                c = get_http_client()
+                r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
+                if r.status_code == 200:
+                    data = r.json()
+                    count = len(data.get("subtitles", []))
+                    print(f"[subtitles] Fetched {count} subtitle tracks for {os_id}")
+                    if len(_sub_cache) > 200:
+                        now = time.time()
+                        for k in [k for k, v in _sub_cache.items() if v[0] <= now]:
+                            del _sub_cache[k]
+                    _sub_cache[key] = (time.time() + _SUB_CACHE_TTL, data)
+                    return _ok(data, os_id)
+            except Exception as e:
+                print(f"[subtitles] OpenSubtitles fetch failed for {os_id}: {e}")
+            return _ok({"subtitles": []}, os_id)
+
         files = _downloaded_files()
         filename = ""
         season, episode = None, None
@@ -843,19 +876,12 @@ def add_routes(app: FastAPI):
 
             os_id = imdb_id if type == "movie" else f"{imdb_id}:{season or 1}:{episode or 1}"
             print(f"[subtitles] Direct IMDb request: {item_id} -> os_id={os_id}")
-            try:
-                c = get_http_client()
-                r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
-                if r.status_code == 200:
-                    return JSONResponse(r.json())
-            except Exception as e:
-                print(f"[subtitles] OpenSubtitles fetch failed for {os_id}: {e}")
-            return JSONResponse({"subtitles": []})
+            return _query_os(type, os_id, season, episode)
 
         # 2. Custom Addon Prefixes (tgdm: for movies, tgds: for series)
         prefix = MOVIE_PREFIX if type == "movie" else SERIES_PREFIX
         if not item_id.startswith(prefix):
-            return JSONResponse({"subtitles": []})
+            return _ok({"subtitles": []}, item_id)
 
         if type == "movie":
             parts = item_id[len(MOVIE_PREFIX):].split(":")
@@ -899,30 +925,18 @@ def add_routes(app: FastAPI):
 
         if not filename:
             print(f"[subtitles] Custom request {item_id}: no matching filename found")
-            return JSONResponse({"subtitles": []})
+            return _ok({"subtitles": []}, item_id)
 
         # 3. IMDb ID Resolution via TMDB / Cinemeta
         _, imdb_id = await get_poster_and_imdb(filename)
         if not imdb_id:
             print(f"[subtitles] Custom request {item_id} ({filename}): IMDb ID resolution failed")
-            return JSONResponse({"subtitles": []})
+            return _ok({"subtitles": []}, item_id)
 
         # 4. Format OpenSubtitles ID & Query OpenSubtitles v3
         os_id = imdb_id if type == "movie" else f"{imdb_id}:{season or 1}:{episode or 1}"
         print(f"[subtitles] Custom request {item_id} ({filename}) -> imdb_id={imdb_id} -> os_id={os_id}")
-
-        try:
-            c = get_http_client()
-            r = await c.get(f"{OPENSUBTITLES_BASE}/subtitles/{type}/{os_id}.json")
-            if r.status_code == 200:
-                data = r.json()
-                count = len(data.get("subtitles", []))
-                print(f"[subtitles] Successfully fetched {count} subtitle tracks for {os_id}")
-                return JSONResponse(data)
-        except Exception as e:
-            print(f"[subtitles] OpenSubtitles fetch failed for {os_id}: {e}")
-
-        return JSONResponse({"subtitles": []})
+        return _query_os(type, os_id, season, episode)
 
     async def _serve_file_impl(chat_id: int, message_id: int, request: Request,
                                file_name: str = None):
