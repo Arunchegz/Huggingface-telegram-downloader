@@ -876,7 +876,7 @@ def add_routes(app: FastAPI):
 
             os_id = imdb_id if type == "movie" else f"{imdb_id}:{season or 1}:{episode or 1}"
             print(f"[subtitles] Direct IMDb request: {item_id} -> os_id={os_id}")
-            return _query_os(type, os_id, season, episode)
+            return await _query_os(type, os_id, season, episode)
 
         # 2. Custom Addon Prefixes (tgdm: for movies, tgds: for series)
         prefix = MOVIE_PREFIX if type == "movie" else SERIES_PREFIX
@@ -936,7 +936,7 @@ def add_routes(app: FastAPI):
         # 4. Format OpenSubtitles ID & Query OpenSubtitles v3
         os_id = imdb_id if type == "movie" else f"{imdb_id}:{season or 1}:{episode or 1}"
         print(f"[subtitles] Custom request {item_id} ({filename}) -> imdb_id={imdb_id} -> os_id={os_id}")
-        return _query_os(type, os_id, season, episode)
+        return await _query_os(type, os_id, season, episode)
 
     async def _serve_file_impl(chat_id: int, message_id: int, request: Request,
                                file_name: str = None):
