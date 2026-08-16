@@ -605,6 +605,7 @@ async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None)
     real_chat_id = row["chat_id"]
     local_path, file_name = row["local_path"], row["file_name"]
 
+    # Step 1: unlink local copy (best-effort; failure must NOT abort bucket delete)
     if local_path:
         p = Path(local_path)
         if p.exists():
@@ -613,10 +614,20 @@ async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None)
             except OSError as e:
                 if status_cb:
                     status_cb(f"⚠ delete local file failed [{real_chat_id}/{mid}]: {e}")
-                return  # leave DB row intact so startup sync can retry
+                # Do NOT return here — still delete from HF bucket and DB
 
+    # Step 2: always remove DB row
     delete_file_row(real_chat_id, mid)
-    delete_bucket_file(real_chat_id, file_name)
+
+    # Step 3: always attempt HF bucket delete (file_name may be None for un-downloaded rows)
+    if file_name:
+        delete_bucket_file(real_chat_id, file_name)
+    else:
+        import logging as _logging
+        _logging.getLogger("tgmanager.telegram_client").warning(
+            f"_remove_downloaded_file: no file_name for [{real_chat_id}/{mid}], skipping bucket delete"
+        )
+
     if status_cb:
         status_cb(f"🗑 Deleted [{real_chat_id}/{mid}] {file_name}")
 
