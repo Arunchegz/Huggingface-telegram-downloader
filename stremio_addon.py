@@ -22,7 +22,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from config import DOWNLOAD_DIR, TMDB_API_KEY, HF_TOKEN, STORAGE_BUCKET_REPO, STORAGE_BUCKET_TYPE
+from config import DOWNLOAD_DIR, TMDB_API_KEY, HF_TOKEN, STORAGE_BUCKET_TYPE
+from bucket import resolve_storage_bucket
 from database import get_conn
 from storage import iter_file_chunks, resolve_local_path
 
@@ -68,9 +69,12 @@ def presign_s3_url(chat_id: int, file_name: str, now=None) -> str:
 
     Returns the full presigned URL, or "" if S3 credentials are not configured.
     """
-    if not (HF_S3_ACCESS_KEY and HF_S3_SECRET_KEY and STORAGE_BUCKET_REPO):
+    if not (HF_S3_ACCESS_KEY and HF_S3_SECRET_KEY):
         return ""
-    owner, bucket = STORAGE_BUCKET_REPO.split("/", 1)
+    storage_bucket = resolve_storage_bucket()
+    if not storage_bucket:
+        return ""
+    owner, bucket = storage_bucket.split("/", 1)
     key = f"{bucket}/downloads/{chat_id}/{file_name}"
     canonical_uri = "/" + owner + "/" + urllib.parse.quote(key, safe="/~")
 
@@ -114,7 +118,7 @@ HF_BUCKET_COLLECTION = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip
 
 def _hf_bucket_url(chat_id: int, file_name: str) -> str:
     """Build the HF bucket resolve URL for a file."""
-    repo = STORAGE_BUCKET_REPO
+    repo = resolve_storage_bucket()
     if not repo:
         return ""
     repo_type = STORAGE_BUCKET_TYPE or "space"
@@ -143,7 +147,7 @@ async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
     HF returns HTTP 302 → Location header contains the signed CDN URL.
     Returns empty string on failure (caller falls back to local proxy).
     """
-    if not STORAGE_BUCKET_REPO or not HF_TOKEN:
+    if not resolve_storage_bucket() or not HF_TOKEN:
         return ""
     bucket_url = _hf_bucket_url(chat_id, file_name)
     if not bucket_url:
@@ -641,7 +645,7 @@ async def _file_url(base: str, f: dict) -> str:
         presigned = presign_s3_url(f["chat_id"], f["file_name"])
         if presigned:
             return presigned
-    if STORAGE_BUCKET_REPO and HF_TOKEN:
+    if resolve_storage_bucket() and HF_TOKEN:
         cdn_url = await get_hf_cdn_url(f["chat_id"], f["file_name"])
         if cdn_url:
             return cdn_url

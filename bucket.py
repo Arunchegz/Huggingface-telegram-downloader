@@ -27,6 +27,55 @@ import logging
 
 logger = logging.getLogger("tgmanager.bucket")
 
+_bucket_cache: str | None = None
+_bucket_cache_set = False
+
+
+def resolve_storage_bucket() -> str:
+    """Return the storage bucket repo id ("owner/name"), for this Space.
+
+    Priority:
+      1. STORAGE_BUCKET_REPO env var (explicit override).
+      2. The bucket volume mounted on this Space, discovered from the HF
+         runtime API (GET /api/spaces/{SPACE_ID} → runtime.volumes[]).
+      3. Empty string (bucket not resolvable).
+
+    Result is cached for the process lifetime.
+    """
+    global _bucket_cache, _bucket_cache_set
+    if _bucket_cache_set:
+        return _bucket_cache
+
+    explicit = os.environ.get("STORAGE_BUCKET_REPO", "").strip()
+    if explicit:
+        _bucket_cache, _bucket_cache_set = explicit, True
+        return explicit
+
+    discovered = ""
+    space_id = (os.environ.get("SPACE_ID") or "").strip()
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if space_id and hf_token:
+        try:
+            import httpx
+            r = httpx.get(
+                f"https://huggingface.co/api/spaces/{space_id}",
+                headers={"Authorization": f"Bearer {hf_token}"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                runtime = r.json().get("runtime") or {}
+                for vol in runtime.get("volumes") or []:
+                    if vol.get("type") == "bucket" and vol.get("source"):
+                        discovered = vol["source"]
+                        break
+            else:
+                logger.warning(f"bucket discovery: space API {r.status_code}")
+        except Exception as e:
+            logger.warning(f"bucket discovery failed: {e}")
+
+    _bucket_cache, _bucket_cache_set = discovered, True
+    return discovered
+
 
 def _sigv4_sign(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -50,7 +99,7 @@ def _s3_delete_url(chat_id: int, file_name: str, now=None) -> str:
     """
     access = os.environ.get("HF_S3_ACCESS_KEY", "")
     secret = os.environ.get("HF_S3_SECRET_KEY", "")
-    repo = os.environ.get("STORAGE_BUCKET_REPO", "")
+    repo = resolve_storage_bucket()
     endpoint = os.environ.get("HF_S3_ENDPOINT", "https://s3.hf.co").rstrip("/")
     if not (access and secret and repo):
         return ""
@@ -135,7 +184,7 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
             logger.warning(f"S3 DELETE failed {chat_id}/{file_name}: {e}")
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    repo = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
+    repo = resolve_storage_bucket()
     repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
     collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
@@ -169,7 +218,7 @@ def list_bucket_files(chat_id: int) -> list[str]:
     # ── S3 ListObjectsV2 ─────────────────────────────────────────────────────
     access = os.environ.get("HF_S3_ACCESS_KEY", "")
     secret = os.environ.get("HF_S3_SECRET_KEY", "")
-    repo   = os.environ.get("STORAGE_BUCKET_REPO", "")
+    repo   = resolve_storage_bucket()
     endpoint = os.environ.get("HF_S3_ENDPOINT", "https://s3.hf.co").rstrip("/")
     region   = os.environ.get("HF_S3_REGION", "us-east-1").strip()
     service  = os.environ.get("HF_S3_SERVICE", "s3").strip()
@@ -233,7 +282,7 @@ def list_bucket_files(chat_id: int) -> list[str]:
     # ── HF Hub list_bucket_tree (Space bucket API) ───────────────────────────
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     # bucket_id is the Space/repo ID that owns the bucket (e.g. "owner/MySpace")
-    bucket_id = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
+    bucket_id = resolve_storage_bucket()
 
     if hf_token and bucket_id:
         try:
