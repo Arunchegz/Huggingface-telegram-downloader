@@ -154,3 +154,99 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
             logger.info(f"HF Hub delete_file [{repo_path}]: {e}")
 
     return True
+
+
+def list_bucket_files(chat_id: int) -> list[str]:
+    """List all file names stored in the bucket under downloads/{chat_id}/.
+
+    Tries S3 ListObjectsV2 first (if S3 creds configured), then falls back to
+    HF Hub list_repo_tree for dataset/model/space backends.
+    Returns bare file names (no path prefix), or [] on error / not configured.
+    """
+    collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
+    prefix_path = f"{collection}/{chat_id}/"
+
+    # ── S3 ListObjectsV2 ─────────────────────────────────────────────────────
+    access = os.environ.get("HF_S3_ACCESS_KEY", "")
+    secret = os.environ.get("HF_S3_SECRET_KEY", "")
+    repo   = os.environ.get("STORAGE_BUCKET_REPO", "")
+    endpoint = os.environ.get("HF_S3_ENDPOINT", "https://s3.hf.co").rstrip("/")
+    region   = os.environ.get("HF_S3_REGION", "us-east-1").strip()
+    service  = os.environ.get("HF_S3_SERVICE", "s3").strip()
+
+    if access and secret and repo:
+        try:
+            import httpx
+            owner, bucket = repo.split("/", 1)
+            key_prefix = f"{bucket}/{prefix_path}"
+            host = urllib.parse.urlparse(endpoint).netloc
+            now = datetime.now(timezone.utc)
+            amz_date   = now.strftime("%Y%m%dT%H%M%SZ")
+            date_stamp = now.strftime("%Y%m%d")
+            scope = f"{date_stamp}/{region}/{service}/aws4_request"
+            params = [
+                ("list-type", "2"),
+                ("prefix",    key_prefix),
+                ("X-Amz-Algorithm",     "AWS4-HMAC-SHA256"),
+                ("X-Amz-Credential",    f"{access}/{scope}"),
+                ("X-Amz-Date",          amz_date),
+                ("X-Amz-Expires",       "60"),
+                ("X-Amz-SignedHeaders", "host"),
+            ]
+            params.sort()
+            qs = "&".join(
+                f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+                for k, v in params
+            )
+            canonical_uri     = f"/{owner}/"
+            canonical_headers = f"host:{host}\n"
+            canonical_request = "\n".join([
+                "GET", canonical_uri, qs,
+                canonical_headers, "host", "UNSIGNED-PAYLOAD",
+            ])
+            string_to_sign = "\n".join([
+                "AWS4-HMAC-SHA256", amz_date, scope,
+                hashlib.sha256(canonical_request.encode()).hexdigest(),
+            ])
+            sig = hmac.new(
+                _sigv4_signing_key(secret, date_stamp),
+                string_to_sign.encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            url = f"{endpoint}{canonical_uri}?{qs}&X-Amz-Signature={sig}"
+            r = httpx.get(url, timeout=30)
+            if r.status_code == 200:
+                import xml.etree.ElementTree as ET
+                ns   = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+                root = ET.fromstring(r.text)
+                files = []
+                for obj in root.findall("s3:Contents", ns):
+                    key_el = obj.find("s3:Key", ns) or obj.find("Key")
+                    key = (key_el.text or "") if key_el is not None else ""
+                    if key.startswith(key_prefix):
+                        files.append(key[len(key_prefix):])
+                return [f for f in files if f]
+            logger.warning(f"S3 list {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"S3 list error: {e}")
+
+    # ── HF Hub list_repo_tree fallback ───────────────────────────────────────
+    hf_token  = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    repo      = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
+    repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
+
+    if hf_token and repo:
+        try:
+            from huggingface_hub import HfApi
+            api   = HfApi(token=hf_token)
+            items = api.list_repo_tree(
+                repo_id=repo,
+                repo_type=repo_type,
+                path_in_repo=prefix_path.rstrip("/"),
+                recursive=False,
+            )
+            return [item.path.split("/")[-1] for item in items if hasattr(item, "path")]
+        except Exception as e:
+            logger.warning(f"HF Hub list_repo_tree error: {e}")
+
+    return []

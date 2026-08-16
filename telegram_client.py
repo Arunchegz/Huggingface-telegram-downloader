@@ -16,7 +16,7 @@ from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
                     POLL_INTERVAL, MAX_CACHE_BYTES, EXTRA_TOKENS,
                     MAX_CONCURRENT_DOWNLOADS)
 from database import upsert_chat, upsert_file, mark_downloaded, log_download, finish_download, get_file_by_msg, delete_file_row
-from bucket import delete_bucket_file
+from bucket import delete_bucket_file, list_bucket_files
 from storage import get_cache_size
 
 _client: Client | None = None
@@ -663,6 +663,84 @@ async def sync_deletions(client: Client, chat_id: int, status_cb=None,
     return removed
 
 
+async def sync_bucket_with_channel(client: Client, chat_id: int, status_cb=None) -> int:
+    """Compare every file in the HF bucket against live channel messages.
+
+    For each file in the bucket under downloads/{chat_id}/, the message_id is
+    extracted from the DB (or from the file name itself if the row is missing).
+    Any bucket file whose source message no longer exists in the channel is
+    deleted from the bucket (and its DB row removed if present).
+
+    This catches orphans that sync_deletions misses — e.g. files whose DB rows
+    were already cleared, or objects uploaded outside the normal download flow.
+
+    Returns the count of bucket files deleted.
+    """
+    from database import get_conn, delete_file_row
+
+    if status_cb:
+        status_cb("🪣 Bucket-vs-channel sync: listing bucket files…")
+
+    bucket_files = await asyncio.to_thread(list_bucket_files, chat_id)
+    if not bucket_files:
+        if status_cb:
+            status_cb("🪣 Bucket-vs-channel sync: bucket empty or not configured, skipping.")
+        return 0
+
+    if status_cb:
+        status_cb(f"🪣 Found {len(bucket_files)} file(s) in bucket for channel {chat_id}")
+
+    # Build set of live message IDs from the channel (full history)
+    live_ids: set[int] = set()
+    try:
+        async for msg in client.get_chat_history(chat_id):
+            live_ids.add(msg.id)
+    except Exception as e:
+        if status_cb:
+            status_cb(f"⚠ Bucket sync: could not fetch channel history: {e}")
+        return 0
+
+    if status_cb:
+        status_cb(f"🪣 Channel has {len(live_ids)} live message(s).")
+
+    # Build file_name → message_id map from DB
+    with get_conn() as conn:
+        db_rows = conn.execute(
+            "SELECT message_id, file_name FROM files WHERE chat_id=?", (chat_id,)
+        ).fetchall()
+    db_map: dict[str, int] = {row["file_name"]: row["message_id"] for row in db_rows if row["file_name"]}
+
+    deleted = 0
+    for file_name in bucket_files:
+        # Resolve message_id: prefer DB lookup, fallback to parsing file name
+        mid = db_map.get(file_name)
+        if mid is None:
+            # Many download paths name files like "{message_id}_{original_name}"
+            # Try to extract a leading integer segment.
+            first = file_name.split("_")[0]
+            try:
+                mid = int(first)
+            except ValueError:
+                mid = None
+
+        if mid is not None and mid in live_ids:
+            continue  # message still exists — keep the file
+
+        # Orphaned: message gone (or we couldn't resolve its ID)
+        if status_cb:
+            status_cb(f"🗑 Bucket orphan: {file_name} (msg_id={mid}) — deleting from bucket")
+        ok = await asyncio.to_thread(delete_bucket_file, chat_id, file_name)
+        if ok:
+            # Clean up DB row if one still exists
+            if mid is not None:
+                await asyncio.to_thread(delete_file_row, chat_id, mid)
+            deleted += 1
+
+    if status_cb:
+        status_cb(f"🪣 Bucket-vs-channel sync done: {deleted} orphan(s) removed.")
+    return deleted
+
+
 async def verify_downloaded_files(chat_id: int, status_cb=None) -> int:
     """Startup integrity check: re-flag files whose bucket object vanished.
 
@@ -799,6 +877,11 @@ async def auto_download_main(status_cb=None) -> None:
         await verify_downloaded_files(row["id"], status_cb=_status)
     except Exception as e:
         _status(f"⚠ Integrity check failed: {e}")
+
+    try:
+        await sync_bucket_with_channel(client, row["id"], status_cb=_status)
+    except Exception as e:
+        _status(f"⚠ Bucket sync failed: {e}")
 
     count = await download_channel_all(row["id"], status_cb=_status, client=client)
     if status_cb:
