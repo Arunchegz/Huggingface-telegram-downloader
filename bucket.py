@@ -230,23 +230,33 @@ def list_bucket_files(chat_id: int) -> list[str]:
         except Exception as e:
             logger.warning(f"S3 list error: {e}")
 
-    # ── HF Hub list_repo_tree fallback ───────────────────────────────────────
-    hf_token  = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    repo      = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
-    repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
+    # ── HF Hub list_bucket_tree (Space bucket API) ───────────────────────────
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    # bucket_id is the Space/repo ID that owns the bucket (e.g. "owner/MySpace")
+    bucket_id = os.environ.get("STORAGE_BUCKET_REPO") or os.environ.get("SPACE_ID")
 
-    if hf_token and repo:
+    if hf_token and bucket_id:
         try:
             from huggingface_hub import HfApi
-            api   = HfApi(token=hf_token)
-            items = api.list_repo_tree(
-                repo_id=repo,
-                repo_type=repo_type,
-                path_in_repo=prefix_path.rstrip("/"),
-                recursive=False,
+            from huggingface_hub import BucketFile
+            api = HfApi(token=hf_token)
+            items = api.list_bucket_tree(
+                bucket_id=bucket_id,
+                prefix=prefix_path,
+                recursive=True,
+                token=hf_token,
             )
-            return [item.path.split("/")[-1] for item in items if hasattr(item, "path")]
+            files = []
+            for item in items:
+                if isinstance(item, BucketFile):
+                    name = item.path.split("/")[-1]
+                    if name:
+                        files.append(name)
+            return files
+        except ImportError:
+            # older huggingface_hub without list_bucket_tree
+            logger.warning("list_bucket_tree not available in this huggingface_hub version")
         except Exception as e:
-            logger.warning(f"HF Hub list_repo_tree error: {e}")
+            logger.warning(f"HF list_bucket_tree error: {e}")
 
     return []
