@@ -51,6 +51,7 @@ HF_S3_REGION = "us-east-1"
 HF_S3_SERVICE = "s3"
 HF_S3_EXPIRES = int(os.environ.get("HF_S3_EXPIRES", "3600"))
 _S3_HOST = urllib.parse.urlparse(HF_S3_ENDPOINT).netloc
+HF_BUCKET_COLLECTION = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
 
 def _sigv4_sign(key: bytes, msg: str) -> bytes:
@@ -74,9 +75,14 @@ def presign_s3_url(chat_id: int, file_name: str, now=None) -> str:
     storage_bucket = resolve_storage_bucket()
     if not storage_bucket:
         return ""
-    owner, bucket = storage_bucket.split("/", 1)
-    key = f"{bucket}/downloads/{chat_id}/{file_name}"
-    canonical_uri = "/" + owner + "/" + urllib.parse.quote(key, safe="/~")
+    if "/" in storage_bucket:
+        owner, bucket = storage_bucket.split("/", 1)
+    else:
+        space_id = os.environ.get("SPACE_ID", "").strip()
+        owner = space_id.split("/")[0] if "/" in space_id else ""
+        bucket = storage_bucket
+    key = f"{bucket}/{HF_BUCKET_COLLECTION}/{chat_id}/{file_name}"
+    canonical_uri = (f"/{owner}/" if owner else "/") + urllib.parse.quote(key, safe="/~")
 
     t = now or datetime.now(timezone.utc)
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
@@ -112,8 +118,6 @@ def presign_s3_url(chat_id: int, file_name: str, now=None) -> str:
     ).hexdigest()
     return f"{HF_S3_ENDPOINT}{canonical_uri}?{qs}&X-Amz-Signature={signature}"
 
-
-HF_BUCKET_COLLECTION = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
 
 def _hf_bucket_url(chat_id: int, file_name: str) -> str:

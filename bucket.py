@@ -40,10 +40,10 @@ def resolve_storage_bucket() -> str:
          runtime API (GET /api/spaces/{SPACE_ID} → runtime.volumes[]).
       3. Empty string (bucket not resolvable).
 
-    Result is cached for the process lifetime.
+    Result is cached for the process lifetime once resolved.
     """
     global _bucket_cache, _bucket_cache_set
-    if _bucket_cache_set:
+    if _bucket_cache_set and _bucket_cache:
         return _bucket_cache
 
     explicit = os.environ.get("STORAGE_BUCKET_REPO", "").strip()
@@ -55,26 +55,55 @@ def resolve_storage_bucket() -> str:
     space_id = (os.environ.get("SPACE_ID") or "").strip()
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if space_id and hf_token:
+        # Method A: HfApi get_space_runtime
         try:
-            import httpx
-            r = httpx.get(
-                f"https://huggingface.co/api/spaces/{space_id}",
-                headers={"Authorization": f"Bearer {hf_token}"},
-                timeout=15,
-            )
-            if r.status_code == 200:
-                runtime = r.json().get("runtime") or {}
-                for vol in runtime.get("volumes") or []:
-                    if vol.get("type") == "bucket" and vol.get("source"):
-                        discovered = vol["source"]
-                        break
-            else:
-                logger.warning(f"bucket discovery: space API {r.status_code}")
+            from huggingface_hub import HfApi
+            api = HfApi(token=hf_token)
+            runtime = api.get_space_runtime(repo_id=space_id)
+            for vol in getattr(runtime, "volumes", []) or []:
+                vtype = getattr(vol, "type", None) or (vol.get("type") if isinstance(vol, dict) else None)
+                vsource = getattr(vol, "source", None) or (vol.get("source") if isinstance(vol, dict) else None)
+                if vtype in ("storage", "bucket", "storage_bucket") and vsource:
+                    discovered = vsource
+                    break
         except Exception as e:
-            logger.warning(f"bucket discovery failed: {e}")
+            logger.debug(f"HfApi get_space_runtime discovery: {e}")
 
-    _bucket_cache, _bucket_cache_set = discovered, True
-    return discovered
+        # Method B: Direct HTTP API query
+        if not discovered:
+            try:
+                import httpx
+                r = httpx.get(
+                    f"https://huggingface.co/api/spaces/{space_id}",
+                    headers={"Authorization": f"Bearer {hf_token}"},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    runtime = r.json().get("runtime") or {}
+                    for vol in runtime.get("volumes") or []:
+                        vol_type = vol.get("type", "")
+                        if vol_type in ("storage", "bucket", "storage_bucket") and vol.get("source"):
+                            discovered = vol["source"]
+                            break
+                else:
+                    logger.warning(f"bucket discovery: space API {r.status_code}")
+            except Exception as e:
+                logger.warning(f"bucket discovery failed: {e}")
+
+    if discovered:
+        _bucket_cache, _bucket_cache_set = discovered, True
+        logger.info(f"Resolved storage bucket: {discovered}")
+        return discovered
+    return ""
+
+
+def _parse_repo_owner_bucket(repo: str) -> tuple[str, str]:
+    """Split 'owner/bucket' safely, defaulting owner from SPACE_ID if missing."""
+    if "/" in repo:
+        return repo.split("/", 1)
+    space_id = (os.environ.get("SPACE_ID") or "").strip()
+    owner = space_id.split("/")[0] if "/" in space_id else ""
+    return owner, repo
 
 
 def _sigv4_sign(key: bytes, msg: str) -> bytes:
@@ -104,9 +133,10 @@ def _s3_delete_url(chat_id: int, file_name: str, now=None) -> str:
     if not (access and secret and repo):
         return ""
 
-    owner, bucket = repo.split("/", 1)
-    key = f"{bucket}/downloads/{chat_id}/{file_name}"
-    canonical_uri = "/" + owner + "/" + urllib.parse.quote(key, safe="/~")
+    owner, bucket = _parse_repo_owner_bucket(repo)
+    collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
+    key = f"{bucket}/{collection}/{chat_id}/{file_name}"
+    canonical_uri = (f"/{owner}/" if owner else "/") + urllib.parse.quote(key, safe="/~")
     host = urllib.parse.urlparse(endpoint).netloc
     region = os.environ.get("HF_S3_REGION", "us-east-1").strip()
     service = os.environ.get("HF_S3_SERVICE", "s3").strip()
@@ -151,21 +181,29 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
     """Delete a file from the storage bucket (best-effort).
 
     Strategy:
-      1. Unlink the local copy under DOWNLOAD_DIR if still present.
+      1. Unlink the local copy under DOWNLOAD_DIR if still present (covers mounted bucket volume).
       2. If S3 gateway credentials are configured, SigV4-DELETE the exact
          bucket object that gets served (`downloads/{chat}/{file}`).
-      3. Else, if HF_TOKEN + a repo are present, attempt HF Hub delete_file
-         (mainly useful for dataset/model-style bucket backends).
+      3. HF Hub Storage Bucket API (batch_bucket_files with delete=[paths]).
+      4. Else fallback to HF Hub delete_file for dataset/model/space git repos.
 
-    Returns True on success or when no action was needed, False on error.
+    Returns True on success or when local file was unlinked, False on complete failure.
     """
-    # Guard: wipe local file if somehow still present
-    local_path = DOWNLOAD_DIR / str(chat_id) / file_name
-    if local_path.exists():
-        try:
-            local_path.unlink()
-        except OSError as e:
-            logger.warning(f"Failed to unlink local file {local_path}: {e}")
+    deleted_any = False
+
+    # Guard: wipe local file if somehow still present (also covers /data bucket mounts)
+    cid_variants = {str(chat_id), str(abs(chat_id))}
+    if str(abs(chat_id)).startswith("100"):
+        cid_variants.add(str(abs(chat_id))[3:])
+    for cid in cid_variants:
+        loc = DOWNLOAD_DIR / cid / file_name
+        if loc.exists():
+            try:
+                loc.unlink()
+                deleted_any = True
+                logger.info(f"Unlinked local file {loc}")
+            except OSError as e:
+                logger.warning(f"Failed to unlink local file {loc}: {e}")
 
     # Real bucket delete: SigV4-signed DELETE against the S3 gateway object.
     delete_url = _s3_delete_url(chat_id, file_name)
@@ -185,31 +223,58 @@ def delete_bucket_file(chat_id: int, file_name: str) -> bool:
 
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     repo = resolve_storage_bucket()
-    repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
     collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
 
     if hf_token and repo:
+        paths_to_delete = [f"{collection}/{chat_id}/{file_name}"]
+        alt_cid = str(chat_id).replace("-100", "").replace("-", "")
+        if alt_cid != str(chat_id):
+            paths_to_delete.append(f"{collection}/{alt_cid}/{file_name}")
+
+        # Primary: HF Storage Bucket API (batch_bucket_files)
+        try:
+            from huggingface_hub import batch_bucket_files
+            batch_bucket_files(
+                bucket_id=repo,
+                delete=paths_to_delete,
+                token=hf_token,
+            )
+            logger.info(f"HF Hub batch_bucket_files deleted [{repo}: {paths_to_delete}]")
+            return True
+        except ImportError:
+            logger.debug("batch_bucket_files not available in huggingface_hub")
+        except Exception as e:
+            logger.warning(f"HF batch_bucket_files failed for {repo}: {e}")
+
+        # Fallback: Git-based repository delete_file (dataset, space, model)
+        repo_type = os.environ.get("STORAGE_BUCKET_TYPE", "space").strip()
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=hf_token)
-            repo_path = f"{collection}/{chat_id}/{file_name}"
-            api.delete_file(
-                path_in_repo=repo_path,
-                repo_id=repo,
-                repo_type=repo_type,
-            )
+            for rpath in paths_to_delete:
+                try:
+                    api.delete_file(
+                        path_in_repo=rpath,
+                        repo_id=repo,
+                        repo_type=repo_type,
+                    )
+                    deleted_any = True
+                    logger.info(f"HF Hub delete_file ok [{repo}:{rpath}]")
+                except Exception:
+                    pass
+            if deleted_any:
+                return True
         except Exception as e:
-            # File may already be gone or not present in bucket; log info
-            logger.info(f"HF Hub delete_file [{repo_path}]: {e}")
+            logger.debug(f"HF Hub delete_file fallback failed [{repo}]: {e}")
 
-    return True
+    return deleted_any
 
 
 def list_bucket_files(chat_id: int) -> list[str]:
     """List all file names stored in the bucket under downloads/{chat_id}/.
 
     Tries S3 ListObjectsV2 first (if S3 creds configured), then falls back to
-    HF Hub list_repo_tree for dataset/model/space backends.
+    HF Hub list_bucket_tree for Space bucket backends, and checks local mount.
     Returns bare file names (no path prefix), or [] on error / not configured.
     """
     collection = os.environ.get("HF_BUCKET_COLLECTION", "downloads").strip()
@@ -226,7 +291,7 @@ def list_bucket_files(chat_id: int) -> list[str]:
     if access and secret and repo:
         try:
             import httpx
-            owner, bucket = repo.split("/", 1)
+            owner, bucket = _parse_repo_owner_bucket(repo)
             key_prefix = f"{bucket}/{prefix_path}"
             host = urllib.parse.urlparse(endpoint).netloc
             now = datetime.now(timezone.utc)
@@ -247,7 +312,7 @@ def list_bucket_files(chat_id: int) -> list[str]:
                 f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
                 for k, v in params
             )
-            canonical_uri     = f"/{owner}/"
+            canonical_uri     = f"/{owner}/" if owner else "/"
             canonical_headers = f"host:{host}\n"
             canonical_request = "\n".join([
                 "GET", canonical_uri, qs,
@@ -281,7 +346,6 @@ def list_bucket_files(chat_id: int) -> list[str]:
 
     # ── HF Hub list_bucket_tree (Space bucket API) ───────────────────────────
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    # bucket_id is the Space/repo ID that owns the bucket (e.g. "owner/MySpace")
     bucket_id = resolve_storage_bucket()
 
     if hf_token and bucket_id:
@@ -301,11 +365,19 @@ def list_bucket_files(chat_id: int) -> list[str]:
                     name = item.path.split("/")[-1]
                     if name:
                         files.append(name)
-            return files
+            if files:
+                return files
         except ImportError:
-            # older huggingface_hub without list_bucket_tree
             logger.warning("list_bucket_tree not available in this huggingface_hub version")
         except Exception as e:
             logger.warning(f"HF list_bucket_tree error: {e}")
+
+    # ── Local directory fallback (if bucket is mounted as volume at /data) ───
+    for cid in (str(chat_id), str(abs(chat_id))):
+        local_dir = DOWNLOAD_DIR / cid
+        if local_dir.exists() and local_dir.is_dir():
+            local_files = [p.name for p in local_dir.iterdir() if p.is_file()]
+            if local_files:
+                return local_files
 
     return []

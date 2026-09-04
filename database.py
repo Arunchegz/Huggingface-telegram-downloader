@@ -180,16 +180,23 @@ def get_downloaded_rows(chat_id: int):
 def delete_file_row(chat_id: int, message_id: int) -> dict | None:
     """Delete DB row for (chat_id, message_id). Returns {local_path, file_name} if it existed."""
     with get_conn() as conn:
+        alt_id1 = abs(chat_id)
+        alt_id2 = int(str(alt_id1).replace("100", "", 1)) if str(alt_id1).startswith("100") else alt_id1
         row = conn.execute(
-            "SELECT local_path, file_name FROM files WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
+            "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND (chat_id=? OR chat_id=? OR chat_id=? OR chat_id=?)",
+            (message_id, chat_id, alt_id1, -alt_id2, alt_id2)
         ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT chat_id, local_path, file_name FROM files WHERE message_id=?",
+                (message_id,)
+            ).fetchone()
         if row is None:
             return None
         info = {"local_path": row["local_path"], "file_name": row["file_name"]}
         conn.execute(
-            "DELETE FROM files WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
+            "DELETE FROM files WHERE message_id=? AND (chat_id=? OR chat_id=? OR chat_id=? OR chat_id=?)",
+            (message_id, chat_id, alt_id1, -alt_id2, alt_id2)
         )
     return info
 

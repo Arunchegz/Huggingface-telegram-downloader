@@ -1,10 +1,16 @@
 """TG Manager Stremio addon server (no UI) — downloads from Telegram and serves them via Stremio."""
 
 import asyncio
+import logging
 import threading
 
 import gradio as gr
 import spaces
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 from database import init_db
 from telegram_client import auto_download_main

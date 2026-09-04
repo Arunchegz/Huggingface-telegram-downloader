@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, FileReferenceExpired
-from pyrogram.raw.types import UpdateDeleteChannelMessages, UpdateDeleteMessages
+from pyrogram.raw.types import UpdateDeleteChannelMessages, UpdateDeleteMessages, UpdateChannelTooLong
 from pyrogram.handlers import RawUpdateHandler, MessageHandler
 
 from config import (API_ID, API_HASH, SESSION_STRING, DOWNLOAD_DIR, CHUNK_SIZE,
@@ -467,8 +467,18 @@ async def watch_channel_new(
     if status_cb:
         status_cb(f"👀 Watching channel (last msg {last_id}, poll {interval}s)")
 
+    poll_count = 0
     while True:
         try:
+            poll_count += 1
+            # Periodically sync deletions every 5 polls to catch deletions missed by MTProto push
+            if poll_count % 5 == 0:
+                try:
+                    await sync_deletions(client, chat_id, status_cb=status_cb)
+                except Exception as e:
+                    if status_cb:
+                        status_cb(f"⚠ Periodic deletion sync failed: {e}")
+
             newest_id = last_id
             dl_clients = get_download_clients()
             pending = []
@@ -591,8 +601,8 @@ async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None)
             alt_id1 = abs(chat_id)
             alt_id2 = int(str(alt_id1).replace("100", "", 1)) if str(alt_id1).startswith("100") else alt_id1
             row = conn.execute(
-                "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND (chat_id=? OR chat_id=? OR chat_id=?)",
-                (mid, chat_id, alt_id1, -alt_id2)
+                "SELECT chat_id, local_path, file_name FROM files WHERE message_id=? AND (chat_id=? OR chat_id=? OR chat_id=? OR chat_id=?)",
+                (mid, chat_id, alt_id1, -alt_id2, alt_id2)
             ).fetchone()
         if not row:
             row = conn.execute(
@@ -601,6 +611,8 @@ async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None)
             ).fetchone()
 
     if not row:
+        if status_cb:
+            status_cb(f"ℹ Deletion for msg {mid} ignored: not found in DB")
         return
     real_chat_id = row["chat_id"]
     local_path, file_name = row["local_path"], row["file_name"]
@@ -616,17 +628,23 @@ async def _remove_downloaded_file(chat_id: int | None, mid: int, status_cb=None)
                     status_cb(f"⚠ delete local file failed [{real_chat_id}/{mid}]: {e}")
                 # Do NOT return here — still delete from HF bucket and DB
 
-    # Step 2: always remove DB row
-    delete_file_row(real_chat_id, mid)
-
-    # Step 3: always attempt HF bucket delete (file_name may be None for un-downloaded rows)
+    # Step 2: always attempt HF bucket delete (run in thread to avoid blocking event loop)
     if file_name:
-        delete_bucket_file(real_chat_id, file_name)
+        try:
+            ok = await asyncio.to_thread(delete_bucket_file, real_chat_id, file_name)
+            if not ok and status_cb:
+                status_cb(f"⚠ HF bucket delete returned False for [{real_chat_id}/{mid}] {file_name}")
+        except Exception as e:
+            if status_cb:
+                status_cb(f"⚠ delete bucket file error [{real_chat_id}/{mid}]: {e}")
     else:
         import logging as _logging
         _logging.getLogger("tgmanager.telegram_client").warning(
             f"_remove_downloaded_file: no file_name for [{real_chat_id}/{mid}], skipping bucket delete"
         )
+
+    # Step 3: remove DB row
+    delete_file_row(real_chat_id, mid)
 
     if status_cb:
         status_cb(f"🗑 Deleted [{real_chat_id}/{mid}] {file_name}")
@@ -773,24 +791,41 @@ def _extract_raw_updates(update) -> list:
 
 async def _handle_delete_update(client: Client, raw_update, users, chats, status_cb=None):
     """Pyrogram raw update handler — fires when messages are deleted in a channel."""
-    sub_updates = _extract_raw_updates(raw_update)
-    for u in sub_updates:
-        chat_id = None
-        msg_ids = []
-        if isinstance(u, UpdateDeleteChannelMessages):
-            channel_id = getattr(u, "channel_id", None)
-            if channel_id:
-                chat_id = int(f"-100{channel_id}")
-            msg_ids = getattr(u, "messages", []) or []
-        elif isinstance(u, UpdateDeleteMessages):
-            msg_ids = getattr(u, "messages", []) or []
-        else:
-            continue
+    try:
+        sub_updates = _extract_raw_updates(raw_update)
+        for u in sub_updates:
+            chat_id = None
+            msg_ids = []
+            if isinstance(u, UpdateDeleteChannelMessages):
+                channel_id = getattr(u, "channel_id", None)
+                if channel_id:
+                    cid_str = str(channel_id).lstrip("-")
+                    chat_id = -int(cid_str) if cid_str.startswith("100") else -int(f"100{cid_str}")
+                msg_ids = getattr(u, "messages", []) or []
+            elif isinstance(u, UpdateDeleteMessages):
+                msg_ids = getattr(u, "messages", []) or []
+            elif isinstance(u, UpdateChannelTooLong):
+                target_chat = _watching_chat_id
+                if target_chat:
+                    if status_cb:
+                        status_cb("🔄 Received UpdateChannelTooLong, resyncing channel deletions…")
+                    await sync_deletions(client, target_chat, status_cb=status_cb)
+                continue
+            else:
+                continue
 
-        for mid in msg_ids:
-            if status_cb:
-                status_cb(f"🗑 Received deletion update for message_id {mid}")
-            await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
+            if chat_id is None and _watching_chat_id is not None:
+                chat_id = _watching_chat_id
+
+            for mid in msg_ids:
+                if status_cb:
+                    status_cb(f"🗑 Received deletion update for message_id {mid} (chat={chat_id})")
+                await _remove_downloaded_file(chat_id, mid, status_cb=status_cb)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        if status_cb:
+            status_cb(f"⚠ Delete update handler error: {e}")
 
 
 def _register_delete_handler(client: Client, status_cb=None):
