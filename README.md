@@ -15,7 +15,9 @@ Auto-downloads media from a Telegram channel and serves it as a Stremio addon (c
 
 ## Setup
 
-### 1. Generate a Pyrogram session string (run locally)
+### 1. Generate a session string (run locally)
+
+This app uses [wzgram](https://wzgram.com/) (a drop-in Pyrogram fork; the import name stays `pyrogram`). Install it with `pip install wzgram` (don't install the original `pyrogram` alongside it).
 
 ```python
 from pyrogram import Client
@@ -29,7 +31,7 @@ with Client("gen", api_id=YOUR_API_ID, api_hash="YOUR_API_HASH") as c:
 |---|---|
 | `TG_API_ID` | Telegram API ID (from my.telegram.org) |
 | `TG_API_HASH` | Telegram API Hash |
-| `TG_SESSION_STRING` | Pyrogram StringSession |
+| `TG_SESSION_STRING` | wzgram/Pyrogram session string |
 | `CHANNEL_REF` | Channel username, invite link, or ID to auto-download from |
 | `PERSISTENT_STORAGE` | `/data` (HF persistent storage mount) |
 | `MAX_CACHE_GB` | Max cache size in GB (default: 10) |
@@ -58,7 +60,7 @@ Resources: catalog (`tgdm:`/`tgds:`), meta, stream (also on `tt` IMDB IDs), subt
 ```
 FastAPI (Gradio server, port 7860)
     ├── Stremio addon routes (catalog / meta / stream / subtitles / tgfile)
-    ├── Pyrogram MTProto client (instant new-message + delete-sync updates)
+    ├── wzgram (Pyrogram-compatible) MTProto client (instant new-message + delete-sync updates)
     ├── SQLite metadata DB
     └── HF Persistent Storage (/data)
 ```
