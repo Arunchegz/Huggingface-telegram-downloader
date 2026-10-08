@@ -232,34 +232,56 @@ def parse_title_year(filename: str) -> tuple[str, str]:
     return re.sub(r"\s+", " ", cut).strip().title(), year
 
 
+# Loose season/episode forms that have no "E": "s2_01", "S02 01", "S2-01", "2x01".
+# Underscore counts as a separator (lookbehind only blocks letters/digits), so a
+# name like "_s2_01__attack_on_titan..." is recognised.
+_SE_LOOSE_S = r"(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(\d{1,3})(?![0-9A-Za-z])"
+_SE_LOOSE_X = r"(?<![A-Za-z0-9])(\d{1,2})[xX](\d{1,3})(?![0-9A-Za-z])"
+_SE_LOOSE_S_RE = re.compile(_SE_LOOSE_S)
+_SE_LOOSE_X_RE = re.compile(_SE_LOOSE_X)
+
 IS_SERIES_RE = re.compile(
     r"[Ss]\d{1,2}[Ee]\d{1,3}"
     r"|[Ss]eason[\s._-]*\d+"
-    r"|[Ee]pisode[\s._-]*\d+",
+    r"|[Ee]pisode[\s._-]*\d+"
+    r"|" + _SE_LOOSE_S +
+    r"|" + _SE_LOOSE_X,
     re.IGNORECASE,
 )
 
 
-def parse_series(filename: str) -> dict | None:
+def _find_season_episode(filename: str):
+    """Return (season, episode) or None. Single source of truth for all parsers."""
     m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
     if m:
-        return {"season": int(m.group(1)), "episode": int(m.group(2))}
-    m2 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m2:
-        return {"season": int(m2.group(1)), "episode": int(m2.group(2))}
-    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m3:
-        return {"season": int(m3.group(1)), "episode": 1}
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    for rx in (_SE_LOOSE_S_RE, _SE_LOOSE_X_RE):
+        m = rx.search(filename)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    m = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), 1
     return None
+
+
+def parse_series(filename: str) -> dict | None:
+    se = _find_season_episode(filename)
+    return {"season": se[0], "episode": se[1]} if se else None
 
 
 def parse_show_title(filename: str) -> str:
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
     name = re.sub(r"[._\-–—+]", " ", name)
-    for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b"]:
-        parts = re.split(pattern, name, flags=re.IGNORECASE)
+    for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b",
+                    _SE_LOOSE_S, _SE_LOOSE_X]:
+        parts = re.split(pattern, name, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
-            name = parts[0]
+            # "S2 01 Attack On Titan 1080p": S/E leads the name -> title is what follows
+            name = parts[0] if parts[0].strip() else parts[-1]
             break
     parts = re.split(r"\b(?:19|20)\d{2}\b", name)
     if len(parts) > 1:
@@ -308,6 +330,8 @@ def _clean_title_prefix(filename: str) -> str:
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
     name = re.sub(r"[._\-–—+]", " ", name)
     name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name)
+    name = re.sub(_SE_LOOSE_S, " ", name)
+    name = re.sub(_SE_LOOSE_X, " ", name)
     name = re.sub(r"\b[Ss]eason\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b[Ee]pisode\s*\d+\b", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b(?:19|20)\d{2}\b", "", name)
@@ -359,16 +383,8 @@ def _matches_title(filename: str, title: str) -> bool:
 
 
 def _parse_season_episode(filename: str) -> tuple[int | None, int | None]:
-    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    m2 = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m2:
-        return int(m2.group(1)), int(m2.group(2))
-    m3 = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
-    if m3:
-        return int(m3.group(1)), 1
-    return None, None
+    se = _find_season_episode(filename)
+    return se if se else (None, None)
 
 
 def _match_score(filename: str, title: str, year: str,
