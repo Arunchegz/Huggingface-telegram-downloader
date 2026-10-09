@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import tempfile
 from pathlib import Path
 import time
 from datetime import datetime, timezone
@@ -299,14 +301,35 @@ async def download_file(
                         return None
                     _mark_broken(try_client)
                     raise _RetryClient()
-                await try_client.download_media(
-                    msg,
-                    file_name=str(out_path),
-                    progress=_progress,
-                )
-                mark_downloaded(chat_id, message_id, str(out_path))
-                finish_download(chat_id, message_id, status="done")
-                return out_path
+                # Download to ephemeral local storage first. When DOWNLOAD_DIR is
+                # backed by an HF bucket, downloading there exposes Pyrogram's
+                # intermediate ".temp" object as a second bucket entry.
+                staging_dir = Path(tempfile.mkdtemp(prefix="tgmanager-download-"))
+                staged_path = staging_dir / file_name
+                try:
+                    result = await try_client.download_media(
+                        msg,
+                        file_name=str(staged_path),
+                        progress=_progress,
+                    )
+                    # Pyrogram/WZGram returns the final path on success and None
+                    # on failure. Never mark a missing/partial file as downloaded.
+                    if not result or not staged_path.is_file():
+                        raise RuntimeError("download_media did not produce a completed file")
+
+                    # Publish only the completed file to persistent storage.
+                    # shutil.move handles cross-filesystem moves by copying then
+                    # removing the staged file.
+                    await asyncio.to_thread(shutil.move, str(staged_path), str(out_path))
+                    if not out_path.is_file():
+                        raise RuntimeError("completed file was not moved to destination")
+
+                    mark_downloaded(chat_id, message_id, str(out_path))
+                    finish_download(chat_id, message_id, status="done")
+                    return out_path
+                finally:
+                    # Also removes any ".temp" file left by an interrupted attempt.
+                    await asyncio.to_thread(shutil.rmtree, staging_dir, True)
 
             except _RetryClient:
                 break  # try the next client
