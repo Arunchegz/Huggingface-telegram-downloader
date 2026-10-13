@@ -145,14 +145,28 @@ def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+# Cache legacy HF CDN resolutions briefly to avoid repeating network round-trips.
+# S3 presigned URLs are generated locally and do not use this cache.
+_HF_CDN_URL_TTL = max(30, min(int(os.environ.get("HF_CDN_URL_CACHE_TTL", "300")), 900))
+_hf_cdn_url_cache: dict[tuple[int, str], tuple[float, str]] = {}
+
+
 async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
     """
     Resolve a private HF bucket file to a CloudFront pre-signed CDN URL.
-    HF returns HTTP 302 → Location header contains the signed CDN URL.
+    Successful resolutions are cached briefly to reduce stream-start latency.
     Returns empty string on failure (caller falls back to local proxy).
     """
     if not resolve_storage_bucket() or not HF_TOKEN:
         return ""
+
+    cache_key = (chat_id, file_name)
+    now = time.monotonic()
+    cached = _hf_cdn_url_cache.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+    if cached:
+        _hf_cdn_url_cache.pop(cache_key, None)
     bucket_url = _hf_bucket_url(chat_id, file_name)
     if not bucket_url:
         return ""
@@ -166,6 +180,16 @@ async def get_hf_cdn_url(chat_id: int, file_name: str) -> str:
         if r.status_code in (301, 302, 303, 307, 308):
             cdn_url = r.headers.get("location", "")
             if cdn_url:
+                # Prune expired entries occasionally to keep memory bounded.
+                if len(_hf_cdn_url_cache) > 2000:
+                    now = time.monotonic()
+                    for key, value in list(_hf_cdn_url_cache.items()):
+                        if value[0] <= now:
+                            _hf_cdn_url_cache.pop(key, None)
+                _hf_cdn_url_cache[cache_key] = (
+                    time.monotonic() + _HF_CDN_URL_TTL,
+                    cdn_url,
+                )
                 return cdn_url
         # Some HF responses return 200 with a redirect body — try anyway
         print(f"[hf-bucket] unexpected status {r.status_code} for {file_name}")
@@ -789,9 +813,24 @@ def add_routes(app: FastAPI):
     async def stream(type: str, item_id: str, request: Request):
         base = _base_url(request)
         files = _downloaded_files()
-        streams = []
 
-        # ── tt IMDB ID: match by title ─────────────────────────────────────
+        # Resolve independent stream URLs concurrently. Legacy HF bucket
+        # resolution performs network I/O, so sequential awaits add each
+        # request's latency to the total response time.
+        async def build_streams(matched_files, include_size=False):
+            urls = await asyncio.gather(*(_file_url(base, f) for f in matched_files))
+            result = []
+            for f, url in zip(matched_files, urls):
+                size_gb = round(f["file_size"] / 1024 ** 3, 2) if f.get("file_size") else None
+                size_str = f" | {size_gb} GB" if include_size and size_gb else ""
+                result.append({
+                    "name": "TG Manager",
+                    "title": f"{f['file_name']}{size_str}",
+                    "url": url,
+                })
+            return result
+
+        # IMDb ID: match by title
         if item_id.startswith("tt"):
             parts = item_id.split(":")
             imdb_id = parts[0]
@@ -802,53 +841,40 @@ def add_routes(app: FastAPI):
                 return JSONResponse({"streams": []})
             scored = []
             for f in files:
-                fn = f["file_name"]
-                score = _match_any(fn, title_candidates, year, season, episode)
+                score = _match_any(f["file_name"], title_candidates, year, season, episode)
                 if score >= MATCH_THRESHOLD:
                     scored.append((score, f))
             scored.sort(key=lambda x: x[0], reverse=True)
-            for score, f in scored:
-                size_gb = round(f["file_size"] / 1024 ** 3, 2) if f.get("file_size") else None
-                size_str = f" | {size_gb} GB" if size_gb else ""
-                streams.append({
-                    "name": "TG Manager",
-                    "title": f"{f['file_name']}{size_str}",
-                    "url": await _file_url(base, f),
-                })
-            return JSONResponse({"streams": streams})
+            matched_files = [f for _, f in scored]
+            return JSONResponse({"streams": await build_streams(matched_files, include_size=True)})
 
-        # ── private tgdm: / tgds: IDs ─────────────────────────────────────
+        # Direct movie ID
         if item_id.startswith(MOVIE_PREFIX):
             parts = item_id[len(MOVIE_PREFIX):].split(":")
             chat_id, msg_id = int(parts[0]), int(parts[1])
-            for f in files:
-                if f["chat_id"] == chat_id and f["message_id"] == msg_id:
-                    streams.append({
-                        "name": "TG Manager",
-                        "title": f["file_name"],
-                        "url": await _file_url(base, f),
-                    })
-            return JSONResponse({"streams": streams})
+            matched_files = [
+                f for f in files
+                if f["chat_id"] == chat_id and f["message_id"] == msg_id
+            ]
+            return JSONResponse({"streams": await build_streams(matched_files)})
 
+        # Series ID
         if item_id.startswith(SERIES_PREFIX):
             parts = item_id[len(SERIES_PREFIX):].split(":")
             sid = parts[0]
             season = int(parts[1]) if len(parts) >= 3 else None
             episode = int(parts[2]) if len(parts) >= 3 else None
-            g = _series_groups(files).get(sid)
-            if g:
-                for f in g["files"]:
+            group = _series_groups(files).get(sid)
+            matched_files = []
+            if group:
+                for f in group["files"]:
                     se = parse_series(f["file_name"])
-                    s = se["season"] if se else 1
-                    e = se["episode"] if se else 1
-                    if season is not None and (s != season or e != episode):
+                    file_season = se["season"] if se else 1
+                    file_episode = se["episode"] if se else 1
+                    if season is not None and (file_season != season or file_episode != episode):
                         continue
-                    streams.append({
-                        "name": "TG Manager",
-                        "title": f["file_name"],
-                        "url": await _file_url(base, f),
-                    })
-            return JSONResponse({"streams": streams})
+                    matched_files.append(f)
+            return JSONResponse({"streams": await build_streams(matched_files)})
 
         return JSONResponse({"streams": []})
 
