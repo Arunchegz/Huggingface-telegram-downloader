@@ -274,6 +274,66 @@ IS_SERIES_RE = re.compile(
 )
 
 
+# ── bare-episode names: "10 Cyberpunk Edgerunners [T4Tsa Cc].mkv" ──────────────
+# Some uploads carry only a leading episode number (no S01E01 marker). A leading
+# number alone is ambiguous ("12 Angry Men", "21 Jump Street"), so a show is only
+# treated as a series when >=2 yearless files share the same title with
+# different leading numbers. The set is rebuilt on every _downloaded_files().
+_BARE_EP_RE = re.compile(r"^\s*[\[(]?(\d{1,3})[\])]?[\s._-]+(?=[A-Za-z])")
+_BARE_SERIES: set[str] = set()
+
+
+def _bare_split(filename: str):
+    """Return (episode, clean_title) for a 'NN Title [tag]' filename, else None."""
+    name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = re.sub(r"[._]", " ", name)
+    m = _BARE_EP_RE.match(name)
+    if not m:
+        return None
+    rest = name[m.end():]
+    rest = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", rest)  # drop [group] / (tag)
+    rest = re.split(
+        r"\b(?:1080p|2160p|720p|480p|bluray|webrip|web dl|bdrip|hdrip|remux|"
+        r"x264|x265|hevc|avc|h264|h265|aac|dts|atmos|10bit)\b",
+        rest, maxsplit=1, flags=re.IGNORECASE,
+    )[0]
+    rest = re.sub(r"\s+", " ", rest).strip(" -")
+    if not rest:
+        return None
+    return int(m.group(1)), rest
+
+
+def _bare_key(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", title.lower())
+
+
+def _refresh_bare_series(files: list[dict]) -> None:
+    global _BARE_SERIES
+    eps: dict[str, set[int]] = {}
+    for f in files:
+        fn = f["file_name"]
+        if IS_SERIES_RE.search(fn) or re.search(r"\b(?:19|20)\d{2}\b", fn):
+            continue
+        sp = _bare_split(fn)
+        if sp:
+            eps.setdefault(_bare_key(sp[1]), set()).add(sp[0])
+    _BARE_SERIES = {k for k, v in eps.items() if len(v) >= 2}
+
+
+def _bare_series_info(filename: str):
+    """(episode, clean_title) if filename belongs to a detected bare-episode show."""
+    if not _BARE_SERIES or IS_SERIES_RE.search(filename):
+        return None
+    sp = _bare_split(filename)
+    if sp and _bare_key(sp[1]) in _BARE_SERIES:
+        return sp
+    return None
+
+
+def _is_series(filename: str) -> bool:
+    return bool(IS_SERIES_RE.search(filename)) or _bare_series_info(filename) is not None
+
+
 def _find_season_episode(filename: str):
     """Return (season, episode) or None. Single source of truth for all parsers."""
     m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
@@ -289,6 +349,9 @@ def _find_season_episode(filename: str):
     m = re.search(r"[Ss]eason[\s._-]*(\d+)", filename, re.IGNORECASE)
     if m:
         return int(m.group(1)), 1
+    bare = _bare_series_info(filename)
+    if bare:
+        return 1, bare[0]
     return None
 
 
@@ -298,6 +361,9 @@ def parse_series(filename: str) -> dict | None:
 
 
 def parse_show_title(filename: str) -> str:
+    bare = _bare_series_info(filename)
+    if bare:
+        return bare[1].title()
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
     name = re.sub(r"[._\-–—+]", " ", name)
     for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b",
@@ -351,6 +417,9 @@ def _normalize_title(title: str) -> str:
 
 
 def _clean_title_prefix(filename: str) -> str:
+    bare = _bare_series_info(filename)
+    if bare:
+        return bare[1].lower()
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
     name = re.sub(r"[._\-–—+]", " ", name)
     name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name)
@@ -471,7 +540,7 @@ async def _tmdb_search(filename: str) -> dict | None:
     """TMDB search (primary): poster + imdb_id via external_ids + title candidates."""
     if not TMDB_API_KEY:
         return None
-    is_series = bool(IS_SERIES_RE.search(filename))
+    is_series = _is_series(filename)
     title = parse_show_title(filename) if is_series else parse_title_year(filename)[0]
     year = "" if is_series else parse_title_year(filename)[1]
     if not title:
@@ -535,7 +604,7 @@ async def _tmdb_search(filename: str) -> dict | None:
 
 async def _fetch_poster_and_imdb(filename: str) -> tuple[str, str]:
     """TMDB search (primary) → poster + imdb_id; Cinemeta search as fallback."""
-    is_series = bool(IS_SERIES_RE.search(filename))
+    is_series = _is_series(filename)
     title = parse_show_title(filename) if is_series else parse_title_year(filename)[0]
     if not title:
         return _placeholder_poster(""), ""
@@ -652,14 +721,16 @@ def _downloaded_files() -> list[dict]:
             "SELECT chat_id, message_id, file_name, file_size, date "
             "FROM files WHERE downloaded=1 ORDER BY date DESC"
         ).fetchall()
-    return [dict(r) for r in rows]
+    files = [dict(r) for r in rows]
+    _refresh_bare_series(files)
+    return files
 
 
 def _series_groups(files: list[dict]) -> dict:
     groups: dict[str, dict] = {}
     for f in files:
         fn = f["file_name"]
-        if not IS_SERIES_RE.search(fn):
+        if not _is_series(fn):
             continue
         sid = show_id(fn)
         if sid not in groups:
@@ -715,7 +786,7 @@ def add_routes(app: FastAPI):
         metas = []
         if type == "movie":
             for f in files:
-                if IS_SERIES_RE.search(f["file_name"]):
+                if _is_series(f["file_name"]):
                     continue
                 title, year = parse_title_year(f["file_name"])
                 poster, _ = await get_poster_and_imdb(f["file_name"])
