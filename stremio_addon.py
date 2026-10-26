@@ -261,6 +261,9 @@ def parse_title_year(filename: str) -> tuple[str, str]:
 # name like "_s2_01__attack_on_titan..." is recognised.
 _SE_LOOSE_S = r"(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+(\d{1,3})(?![0-9A-Za-z])"
 _SE_LOOSE_X = r"(?<![A-Za-z0-9])(\d{1,2})[xX](\d{1,3})(?![0-9A-Za-z])"
+# "S04 E28", "S04.E28", "S04_E28", "S04 - E28": separator between the S and E parts.
+_SE_SPACED = r"(?<![A-Za-z0-9])[Ss](\d{1,2})[\s._-]+[Ee](\d{1,3})(?![0-9])"
+_SE_SPACED_RE = re.compile(_SE_SPACED)
 _SE_LOOSE_S_RE = re.compile(_SE_LOOSE_S)
 _SE_LOOSE_X_RE = re.compile(_SE_LOOSE_X)
 
@@ -268,6 +271,7 @@ IS_SERIES_RE = re.compile(
     r"[Ss]\d{1,2}[Ee]\d{1,3}"
     r"|[Ss]eason[\s._-]*\d+"
     r"|[Ee]pisode[\s._-]*\d+"
+    r"|" + _SE_SPACED +
     r"|" + _SE_LOOSE_S +
     r"|" + _SE_LOOSE_X,
     re.IGNORECASE,
@@ -339,6 +343,9 @@ def _find_season_episode(filename: str):
     m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", filename)
     if m:
         return int(m.group(1)), int(m.group(2))
+    m = _SE_SPACED_RE.search(filename)
+    if m:
+        return int(m.group(1)), int(m.group(2))
     m = re.search(r"[Ss]eason[\s._-]*(\d+)[\s\S]*?[Ee]pisode[\s._-]*(\d+)", filename, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
@@ -360,13 +367,19 @@ def parse_series(filename: str) -> dict | None:
     return {"season": se[0], "episode": se[1]} if se else None
 
 
+def _strip_group_tags(name: str) -> str:
+    """Drop release-group tags like "[T4Tsa Cc]" / "(Group)" so they don't pollute the title."""
+    return re.sub(r"\[[^\]]*\]|\((?!\s*(?:19|20)\d{2}\s*\))[^)]*\)", " ", name)
+
+
 def parse_show_title(filename: str) -> str:
     bare = _bare_series_info(filename)
     if bare:
         return bare[1].title()
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = _strip_group_tags(name)
     name = re.sub(r"[._\-–—+]", " ", name)
-    for pattern in [r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b",
+    for pattern in [r"\b[Ss]\d{1,2}[\s._-]*[Ee]\d{1,3}\b", r"\b[Ss]eason\s*\d+\b", r"\b[Ee]pisode\s*\d+\b",
                     _SE_LOOSE_S, _SE_LOOSE_X]:
         parts = re.split(pattern, name, maxsplit=1, flags=re.IGNORECASE)
         if len(parts) > 1:
@@ -421,8 +434,9 @@ def _clean_title_prefix(filename: str) -> str:
     if bare:
         return bare[1].lower()
     name = re.sub(r"\.[a-zA-Z0-9]{2,4}$", "", filename)
+    name = _strip_group_tags(name)
     name = re.sub(r"[._\-–—+]", " ", name)
-    name = re.sub(r"\b[Ss]\d{1,2}[Ee]\d{1,3}\b", "", name)
+    name = re.sub(r"\b[Ss]\d{1,2}[\s._-]*[Ee]\d{1,3}\b", "", name)
     name = re.sub(_SE_LOOSE_S, " ", name)
     name = re.sub(_SE_LOOSE_X, " ", name)
     name = re.sub(r"\b[Ss]eason\s*\d+\b", "", name, flags=re.IGNORECASE)
